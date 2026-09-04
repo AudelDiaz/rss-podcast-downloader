@@ -1,0 +1,19 @@
+# Example config for rss-podcast-downloader
+# Place at ./rss-podcast-downloader.toml or ~/.config/rss-podcast-downloader/config.toml
+# All keys under [defaults] map to CLI flags (CLI always wins).
+
+[defaults]
+# save_dir = "./podcasts"
+# keep = 10
+# max_age = "30d"
+# max_size = "2G"
+# verbose = false
+# quiet = false
+# save_text = false
+# num_episodes = 5
+# since = "2024-01-01"
+# all = false
+# keep_last = false
+# dry_run = false
+keep = 5
+verbose = false

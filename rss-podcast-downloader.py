@@ -15,11 +15,20 @@ Usage:
 Options:
     --feed-id N        Pull a feed already stored in the database by its id.
     --list-feeds       List all feeds in the database (with their save dirs) and exit.
+    --remove-feed ID   Remove feed ID and its episodes (use --delete-files to also delete files).
+    --export-opml FILE Export feeds to OPML file.
+    --import-opml FILE Import feeds from OPML file.
     --keep-last        Keep only the newest episode per feed after downloading.
+    --keep N           Keep only N newest episodes (flexible retention).
+    --max-age DAYS     Keep only episodes newer than DAYS days (e.g. 30, 30d).
+    --max-size SIZE    Keep newest until total size <= SIZE (e.g. 500M, 2G).
     --num-episodes N   Only consider N episodes published after the last download.
     --since DATE       Only consider episodes published on/after DATE (YYYY-MM-DD).
     --all              On a feed with no prior downloads, download the full archive.
     --save_text        Also save a .txt sidecar with episode details.
+    --dry-run          Show what would be downloaded without downloading.
+    --verbose          Enable DEBUG logging.
+    --quiet            Suppress INFO logging (WARNING only).
 
 A feed with no prior downloads requires one of --num-episodes, --since, or --all;
 otherwise nothing is downloaded.
@@ -41,10 +50,12 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import time
 import unicodedata
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import feedparser
@@ -52,10 +63,88 @@ import requests
 from mutagen.id3 import COMM, ID3, TALB, TCON, TDRC, TIT2, TPE1, TPE2
 from mutagen.mp3 import MP3
 
+__version__ = '1.1.0'
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-USER_AGENT = 'rss-podcast-downloader/1.0 (+https://github.com/johnsosoka/rss-podcast-downloader)'
+USER_AGENT = (
+    f'rss-podcast-downloader/{__version__} (+https://github.com/johnsosoka/rss-podcast-downloader)'
+)
+
+
+def find_config_path(explicit=None, no_config=False):
+    """Resolve config file path by priority.
+
+    Priority: explicit > ./rss-podcast-downloader.toml (cwd) > XDG > ~/.config/...
+    Returns Path or None.
+    """
+    if no_config:
+        return None
+    if explicit:
+        return Path(explicit).expanduser()
+    candidates = [
+        Path.cwd() / 'rss-podcast-downloader.toml',
+    ]
+    xdg = os.environ.get('XDG_CONFIG_HOME')
+    if xdg:
+        candidates.append(Path(xdg) / 'rss-podcast-downloader' / 'config.toml')
+    candidates.append(Path.home() / '.config' / 'rss-podcast-downloader' / 'config.toml')
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p
+    return None
+
+
+def load_config(path=None):
+    """Load TOML config and return defaults dict.
+
+    Supports [defaults] table or top-level scalar keys. Returns {} if missing.
+    """
+    if path is None:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        import tomllib  # py311+
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib  # type: ignore
+        except ModuleNotFoundError:
+            logging.warning('tomllib not available, cannot load config %s', p)
+            return {}
+    try:
+        with open(p, 'rb') as f:
+            data = tomllib.load(f)
+    except Exception as e:  # noqa: BLE001
+        logging.warning('Failed to parse config %s: %s', p, e)
+        return {}
+    if 'defaults' in data and isinstance(data['defaults'], dict):
+        return dict(data['defaults'])
+    # Fallback: top-level scalar keys (only non-positional, to avoid surprising auto-selection)
+    known = {
+        'keep',
+        'max_age',
+        'max_size',
+        'verbose',
+        'quiet',
+        'save_text',
+        'num_episodes',
+        'since',
+        'all',
+        'keep_last',
+        'dry_run',
+    }
+    result = {}
+    for k, v in data.items():
+        if isinstance(v, dict):
+            continue
+        nk = k.replace('-', '_')
+        if nk in known:
+            result[nk] = v
+    return result
+
 
 # Date formats commonly found in RSS <pubDate> elements.
 DATE_FORMATS = [
@@ -176,13 +265,14 @@ def sanitize_filename_from_entry(entry):
     return sanitize_title(entry.get('title', 'untitled'), prefix)
 
 
-def download_file(url, filename, session=None, retries=3):
+def download_file(url, filename, session=None, retries=3, sleep_fn=None):
     """Stream a file from ``url`` to ``filename`` with retry/backoff logic.
 
     Returns ``True`` on success. A partial file is removed before each retry so
     a truncated download is never mistaken for a complete one.
     """
     session = session if session is not None else requests
+    _sleep = sleep_fn if sleep_fn is not None else time.sleep
     headers = {'User-Agent': USER_AGENT}
 
     for attempt in range(1, retries + 1):
@@ -193,7 +283,10 @@ def download_file(url, filename, session=None, retries=3):
                 # so a clean-but-truncated body is still treated as a failure.
                 expected = response.headers.get('Content-Length')
                 if expected is not None:
-                    expected = int(expected)
+                    try:
+                        expected = int(expected)
+                    except (TypeError, ValueError):
+                        expected = None
                 written = 0
                 with open(filename, 'wb') as file:
                     for chunk in response.iter_content(chunk_size=8192):
@@ -218,7 +311,7 @@ def download_file(url, filename, session=None, retries=3):
             if attempt < retries:
                 sleep_time = 2**attempt  # Exponential backoff: 2, 4, 8 seconds.
                 logging.info('Retrying in %s seconds...', sleep_time)
-                time.sleep(sleep_time)
+                _sleep(sleep_time)
             else:
                 logging.error('Failed to download %s after %s attempts.', url, retries)
     return False
@@ -394,6 +487,163 @@ def get_feed_url_by_id(conn, feed_id):
     return result[0] if result else None
 
 
+def remove_feed(conn, feed_id, delete_files=False):
+    """Remove a feed and its episodes.
+
+    Args:
+        delete_files: if True, also delete on-disk files under the feed's save_dir.
+    Returns True if feed existed and was removed, False otherwise.
+    """
+    cursor = conn.cursor()
+    cursor.execute('SELECT save_dir FROM feeds WHERE feed_id = ?', (feed_id,))
+    row = cursor.fetchone()
+    if not row:
+        return False
+    save_dir = row[0]
+
+    filepaths = []
+    if delete_files and save_dir:
+        filepaths = [
+            r[0]
+            for r in cursor.execute(
+                'SELECT filepath FROM episodes WHERE feed_id = ?', (feed_id,)
+            ).fetchall()
+            if r[0]
+        ]
+
+    cursor.execute('DELETE FROM episodes WHERE feed_id = ?', (feed_id,))
+    cursor.execute('DELETE FROM feeds WHERE feed_id = ?', (feed_id,))
+
+    # Best-effort file removal before commit (so DB and files stay closer to atomic)
+    if delete_files and save_dir and filepaths:
+        abs_save = os.path.abspath(save_dir)
+        for fp in filepaths:
+            try:
+                abs_fp = os.path.abspath(fp)
+                if os.path.commonpath([abs_save, abs_fp]) == abs_save and os.path.exists(fp):
+                    os.remove(fp)
+                    logging.info('Removed file for deleted feed %s: %s', feed_id, fp)
+            except (OSError, ValueError):
+                pass
+
+    conn.commit()
+    logging.info(
+        'Removed feed %s (%s episode(s))', feed_id, len(filepaths) if delete_files else 'unknown'
+    )
+    return True
+
+
+def export_opml(db_path=None, output_path=None):
+    """Export all feeds to an OPML file."""
+    import xml.etree.ElementTree as ET
+
+    if output_path is None:
+        raise ValueError('output_path required')
+    # Avoid creating a stray DB on read-only export (review finding)
+    if db_path is not None:
+        if not Path(db_path).exists():
+            rows = []
+        else:
+            conn = setup_database(db_path)
+            try:
+                rows = conn.execute(
+                    'SELECT feed_url, feed_title FROM feeds ORDER BY feed_id'
+                ).fetchall()
+            finally:
+                conn.close()
+    else:
+        default_path = Path(
+            os.path.join(os.path.dirname(os.path.realpath(__file__)), 'downloads.db')
+        )
+        if not default_path.exists():
+            rows = []
+        else:
+            conn = setup_database(db_path)
+            try:
+                rows = conn.execute(
+                    'SELECT feed_url, feed_title FROM feeds ORDER BY feed_id'
+                ).fetchall()
+            finally:
+                conn.close()
+
+    opml = ET.Element('opml', version='2.0')
+    head = ET.SubElement(opml, 'head')
+    ET.SubElement(head, 'title').text = 'RSS Podcast Downloader Feeds'
+    body = ET.SubElement(opml, 'body')
+    for feed_url, feed_title in rows:
+        ET.SubElement(
+            body,
+            'outline',
+            type='rss',
+            text=feed_title or feed_url,
+            title=feed_title or feed_url,
+            xmlUrl=feed_url,
+        )
+
+    tree = ET.ElementTree(opml)
+    # Pretty? Minimal — write with xml declaration
+    ET.indent(tree, space='  ') if hasattr(ET, 'indent') else None
+    tree.write(output_path, encoding='utf-8', xml_declaration=True)
+    logging.info('Exported %s feed(s) to %s', len(rows), output_path)
+    return len(rows)
+
+
+def import_opml(db_path=None, input_path=None):
+    """Import feeds from an OPML file. Returns (imported, skipped)."""
+    import xml.etree.ElementTree as ET
+
+    if input_path is None or not os.path.exists(input_path):
+        raise FileNotFoundError(f'OPML file not found: {input_path}')
+    tree = ET.parse(input_path)
+    root = tree.getroot()
+    # Collect all outline elements with xmlUrl (case-insensitive, recursively)
+    urls = []
+    for outline in root.iter('outline'):
+        xml_url = None
+        for k, v in outline.attrib.items():
+            if k.lower() == 'xmlurl':
+                xml_url = v
+                break
+        if xml_url:
+            title = outline.get('text') or outline.get('title') or xml_url
+            urls.append((xml_url.strip(), title.strip()))
+
+    if not urls:
+        logging.warning('No feeds found in OPML: %s', input_path)
+        return (0, 0)
+
+    conn = setup_database(db_path)
+    imported = 0
+    skipped = 0
+    try:
+        # Build normalized existing set to catch duplicates with trailing slash / case
+        existing_rows = conn.execute('SELECT feed_url FROM feeds').fetchall()
+        existing_norm = {r[0].strip().rstrip('/').lower() for r in existing_rows if r[0]}
+
+        for feed_url, feed_title in urls:
+            norm = feed_url.strip().rstrip('/').lower()
+            if norm in existing_norm:
+                skipped += 1
+                continue
+            cursor = conn.cursor()
+            cursor.execute('SELECT feed_id FROM feeds WHERE feed_url = ?', (feed_url,))
+            if cursor.fetchone():
+                skipped += 1
+                existing_norm.add(norm)
+                continue
+            cursor.execute(
+                'INSERT INTO feeds (feed_url, feed_title) VALUES (?, ?)',
+                (feed_url, feed_title),
+            )
+            imported += 1
+            existing_norm.add(norm)
+        conn.commit()
+    finally:
+        conn.close()
+    logging.info('Imported %s feed(s), skipped %s existing', imported, skipped)
+    return (imported, skipped)
+
+
 def _get_last_downloaded_date(conn, feed_id):
     """Return the newest ``published`` datetime already downloaded for a feed.
 
@@ -473,47 +723,176 @@ def _select_candidates(
     return base
 
 
+def parse_size(value):
+    """Parse human size string to bytes. Accepts 500, 500K, 500M, 2G (1024-base)."""
+    s = str(value).strip().lower()
+    if not s:
+        raise ValueError('empty size')
+    m = re.match(r'^(\d+(?:\.\d+)?)\s*([kmg]?b?)?$', s)
+    if not m:
+        raise ValueError(f'Invalid size: {value!r}')
+    num = float(m.group(1))
+    unit = (m.group(2) or '').strip()
+    mult = 1
+    if unit.startswith('k'):
+        mult = 1024
+    elif unit.startswith('m'):
+        mult = 1024**2
+    elif unit.startswith('g'):
+        mult = 1024**3
+    return int(num * mult)
+
+
+def parse_max_age(value):
+    """Parse age string to timedelta. Accepts '30', '30d', '30days' (days)."""
+    from datetime import timedelta
+
+    s = str(value).strip().lower()
+    m = re.match(r'^(\d+)\s*(d|day|days)?$', s)
+    if not m:
+        raise ValueError(f'Invalid max-age: {value!r}')
+    days = int(m.group(1))
+    if days < 1:
+        raise ValueError('max-age must be >=1 day')
+    return timedelta(days=days)
+
+
+def prune_feed(conn, feed_id, save_dir, keep=None, max_age=None, max_size=None, dry_run=False):
+    """Flexible retention: keep N newest, drop older than max_age, cap total size.
+
+    Args:
+        keep: int or None — keep N newest (N>=1).
+        max_age: timedelta, datetime, or None — drop episodes with published < now - max_age.
+                 A datetime is treated as cutoff directly.
+        max_size: int bytes or None — keep newest until total size <= max_size.
+        dry_run: if True, log but do not delete rows/files.
+
+    Returns (kept_count, removed_count).
+    """
+    from datetime import timedelta
+
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT episode_id, filepath, published FROM episodes WHERE feed_id = ? '
+        'ORDER BY published DESC, episode_id DESC',
+        (feed_id,),
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        return (0, 0)
+
+    # Normalize max_age to cutoff datetime (use UTC to match stored naive UTC)
+    cutoff = None
+    if max_age is not None:
+        if isinstance(max_age, timedelta):
+            cutoff = datetime.utcnow() - max_age
+        elif isinstance(max_age, datetime):
+            cutoff = max_age
+        else:
+            raise TypeError('max_age must be timedelta or datetime')
+
+    # Phase 1: keep N
+    if keep is not None:
+        if keep < 1:
+            raise ValueError('--keep must be >=1')
+        kept_rows = rows[:keep]
+        removed_rows = rows[keep:]
+    else:
+        kept_rows = list(rows)
+        removed_rows = []
+
+    # Phase 2: max-age — move aged kept rows to removed
+    if cutoff is not None:
+        still_kept = []
+        for eid, fp, pub in kept_rows:
+            if not pub:
+                still_kept.append((eid, fp, pub))
+                continue
+            try:
+                dt = datetime.fromisoformat(pub)
+            except (ValueError, TypeError):
+                still_kept.append((eid, fp, pub))
+                continue
+            if dt < cutoff:
+                removed_rows.append((eid, fp, pub))
+            else:
+                still_kept.append((eid, fp, pub))
+        kept_rows = still_kept
+
+    # Phase 3: max-size — keep newest until size cap
+    if max_size is not None:
+        acc = 0
+        sized_kept = []
+        sized_removed = []
+        for eid, fp, pub in kept_rows:
+            sz = 0
+            if fp and os.path.exists(fp):
+                try:
+                    sz = os.path.getsize(fp)
+                except OSError:
+                    sz = 0
+            if acc + sz <= max_size or not sized_kept:
+                # Always keep at least the single newest even if over cap
+                sized_kept.append((eid, fp, pub))
+                acc += sz
+            else:
+                sized_removed.append((eid, fp, pub))
+        # Any removed by size joins the global removed list
+        removed_rows = sized_removed + removed_rows
+        kept_rows = sized_kept
+
+    if not removed_rows:
+        return (len(kept_rows), 0)
+
+    kept_paths = {os.path.abspath(fp) for _, fp, _ in kept_rows if fp}
+    if dry_run:
+        logging.info(
+            'DRY-RUN prune: would keep %s, remove %s (keep=%s max_age=%s max_size=%s)',
+            len(kept_rows),
+            len(removed_rows),
+            keep,
+            max_age,
+            max_size,
+        )
+        for eid, fp, pub in removed_rows:
+            logging.info('  would remove episode_id=%s filepath=%s published=%s', eid, fp, pub)
+        return (len(kept_rows), len(removed_rows))
+
+    removed = 0
+    for eid, fp, _pub in removed_rows:
+        cursor.execute('DELETE FROM episodes WHERE episode_id = ?', (eid,))
+        removed += 1
+        if fp and os.path.abspath(fp) not in kept_paths:
+            try:
+                if os.path.commonpath([os.path.abspath(save_dir), os.path.abspath(fp)]) == (
+                    os.path.abspath(save_dir)
+                ) and os.path.exists(fp):
+                    os.remove(fp)
+                    logging.info('Removed pruned file: %s', fp)
+            except (OSError, ValueError):
+                pass
+    conn.commit()
+    if removed:
+        logging.info('Pruned %s old episode(s); keeping %s newest.', removed, len(kept_rows))
+    return (len(kept_rows), removed)
+
+
 def prune_to_keep_last(conn, feed_id, save_dir):
     """Keep only the newest downloaded episode row (and file) for a feed.
 
     Deletes older episode rows for ``feed_id`` and removes their on-disk files
     when they live under ``save_dir``. The newest row is kept as a sync reference.
     """
-    cursor = conn.cursor()
-    cursor.execute(
-        'SELECT episode_id, filepath FROM episodes WHERE feed_id = ? '
-        'ORDER BY published DESC, episode_id DESC',
-        (feed_id,),
-    )
-    rows = cursor.fetchall()
-    if not rows:
-        return
-    # Rows to keep (the newest). Only delete a file if no KEPT row references it,
-    # so a shared filepath (e.g. re-posted episodes) is not removed out from under
-    # the surviving row.
-    kept_paths = {os.path.abspath(filepath) for _, filepath in rows[:1] if filepath}
-    removed = 0
-    for episode_id, filepath in rows[1:]:
-        cursor.execute('DELETE FROM episodes WHERE episode_id = ?', (episode_id,))
-        removed += 1
-        if filepath and os.path.abspath(filepath) not in kept_paths:
-            try:
-                if os.path.commonpath([os.path.abspath(save_dir), os.path.abspath(filepath)]) == (
-                    os.path.abspath(save_dir)
-                ) and os.path.exists(filepath):
-                    os.remove(filepath)
-                    logging.info('Removed kept-last pruned file: %s', filepath)
-            except (OSError, ValueError):
-                # File already gone or outside save_dir; not fatal.
-                pass
-    conn.commit()
-    if removed:
-        logging.info('--keep-last: pruned %s old episode(s); keeping newest.', removed)
+    prune_feed(conn, feed_id, save_dir, keep=1)
 
 
 def save_text_file(entry, filename):
     """Save podcast details alongside the audio file in a ``.txt`` file."""
-    with open(f'{filename}.txt', 'w') as file:
+    # Caller passes the full audio path (e.g. /dir/ep.mp3); sidecar must be
+    # /dir/ep.txt not /dir/ep.mp3.txt. Strip any existing extension first.
+    base, _ext = os.path.splitext(filename)
+    txt_path = f'{base}.txt' if _ext else f'{filename}.txt'
+    with open(txt_path, 'w', encoding='utf-8') as file:
         file.write(f'Title: {entry.get("title", "N/A")}\n')
         file.write(f'Subtitle: {entry.get("subtitle", "N/A")}\n')
         file.write(f'Published Date: {entry.get("published", "N/A")}\n')
@@ -567,6 +946,46 @@ def set_mp3_tags(filename, entry, feed):
         logging.error('Could not tag file (continuing): %s - %s', filename, e)
 
 
+def _is_audio_enclosure(link):
+    """Return True for podcast audio/video enclosures.
+
+    Accepts any ``audio/*`` type (covers audio/mpeg, audio/mp3, audio/mp4,
+    audio/x-mpeg, audio/ogg…) plus ``video/mp4``/``video/mpeg`` which some
+    feeds use for video podcasts. Falls back to extension check only when type is
+    missing/empty.
+    """
+    t = getattr(link, 'type', None) or ''
+    t = t.lower().strip()
+    if t:
+        return t.startswith('audio/') or t in ('video/mp4', 'video/mpeg')
+    # Fallback: URL with known audio/video extension only when type is absent.
+    href = getattr(link, 'href', '') or ''
+    _, ext = os.path.splitext(urlparse(unquote(href)).path)
+    return ext.lower() in ('.mp3', '.m4a', '.mp4', '.ogg', '.opus', '.flac', '.wav', '.aac')
+
+
+def _unique_filepath(save_dir, basename, ext):
+    """Return a non-colliding path inside save_dir, adding _2, _3 suffixes."""
+    candidate = os.path.join(save_dir, basename + ext)
+    if not os.path.exists(candidate):
+        return candidate
+    counter = 2
+    while True:
+        candidate = os.path.join(save_dir, f'{basename}_{counter}{ext}')
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
+        if counter > 1000:
+            # Pathological collision (1000 same names) — use uuid to avoid overwrite
+            import uuid
+
+            candidate = os.path.join(save_dir, f'{basename}_{uuid.uuid4().hex[:8]}{ext}')
+            if not os.path.exists(candidate):
+                return candidate
+            # If even uuid collides (extremely unlikely), keep trying
+            continue
+
+
 def _episode_sort_key(entry_link):
     """Sort key so episodes order by publication recency, newest first."""
     entry, _link = entry_link
@@ -585,6 +1004,7 @@ def parse_and_download(
     session=None,
     since=None,
     full_history=False,
+    dry_run=False,
 ):
     """Parse the RSS feed and download any episodes not already in the database."""
     if not conn or not feed_id or not feed:
@@ -597,7 +1017,7 @@ def parse_and_download(
         (entry, link)
         for entry in feed.entries
         for link in entry.get('links', [])
-        if link.type == 'audio/mpeg'
+        if _is_audio_enclosure(link)
     ]
 
     # Decide which episodes to consider this run. Incremental sync: only
@@ -666,17 +1086,58 @@ def parse_and_download(
         total_to_download,
     )
 
+    if dry_run:
+        if total_to_download == 0:
+            logging.info('DRY-RUN: nothing would be downloaded.')
+        else:
+            logging.info('DRY-RUN: would download %s episode(s):', total_to_download)
+            for entry, link in episodes_to_download:
+                fn = sanitize_filename_from_entry(entry)
+                if len(fn) > 200:
+                    fn = fn[:200].rstrip('_-')
+                if not fn:
+                    fn = 'untitled'
+                parsed = urlparse(unquote(link.href))
+                _, ext = os.path.splitext(parsed.path)
+                if not ext:
+                    lt = (getattr(link, 'type', '') or '').lower()
+                    if lt.startswith('audio/'):
+                        ext = '.mp3'
+                    elif lt.startswith('video/'):
+                        ext = '.mp4'
+                    else:
+                        ext = '.mp3'
+                # Show what file would be (with unique suffix if collision)
+                preview = (
+                    _unique_filepath(save_dir, fn, ext)
+                    if os.path.exists(os.path.join(save_dir, fn + ext))
+                    else os.path.join(save_dir, fn + ext)
+                )
+                logging.info('  - %s  [%s] -> %s', fn, link.href, preview)
+        return
+
     successful_downloads = 0
     for i, (entry, link) in enumerate(episodes_to_download):
         filename = sanitize_filename_from_entry(entry)
+        # Guard against filesystem limits (255 char filename, 260+ path).
+        if len(filename) > 200:
+            filename = filename[:200].rstrip('_-')
+        if not filename:
+            filename = 'untitled'
 
-        # Resolve the file extension from the URL, defaulting to .mp3 for audio.
+        # Resolve the file extension from the URL, defaulting based on MIME.
         parsed_url = urlparse(unquote(link.href))
         _, file_extension = os.path.splitext(parsed_url.path)
-        if not file_extension and link.type == 'audio/mpeg':
-            file_extension = '.mp3'
+        if not file_extension:
+            lt = (getattr(link, 'type', '') or '').lower()
+            if lt.startswith('audio/'):
+                file_extension = '.mp3'
+            elif lt.startswith('video/'):
+                file_extension = '.mp4'
+            else:
+                file_extension = '.mp3'
 
-        full_path = os.path.join(save_dir, filename + file_extension)
+        full_path = _unique_filepath(save_dir, filename, file_extension)
 
         logging.info('Downloading audio file %s of %s: %s', i + 1, total_to_download, filename)
         if download_file(link.href, full_path, session=session):
@@ -744,6 +1205,25 @@ def main():
         help='After downloading, keep only the newest episode per feed as a sync reference',
     )
     parser.add_argument(
+        '--keep',
+        type=int,
+        default=None,
+        metavar='N',
+        help='Keep only N newest episodes per feed (prunes older files/rows)',
+    )
+    parser.add_argument(
+        '--max-age',
+        default=None,
+        metavar='DAYS',
+        help='Keep only episodes newer than DAYS days (e.g. 30, 30d). Dateless kept.',
+    )
+    parser.add_argument(
+        '--max-size',
+        default=None,
+        metavar='SIZE',
+        help='Keep newest episodes until total size <= SIZE (e.g. 500M, 2G, 1024).',
+    )
+    parser.add_argument(
         '--save_text', action='store_true', help='Save .txt files with extra episode data'
     )
     parser.add_argument(
@@ -763,13 +1243,133 @@ def main():
         action='store_true',
         help='On a feed with no prior downloads, download the full archive',
     )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Show what would be downloaded without downloading or writing DB',
+    )
+    parser.add_argument('--verbose', action='store_true', help='Verbose logging (DEBUG)')
+    parser.add_argument('--quiet', action='store_true', help='Quiet logging (WARNING only)')
+    parser.add_argument(
+        '--remove-feed', type=int, default=None, metavar='ID', help='Remove feed by ID and exit'
+    )
+    parser.add_argument(
+        '--delete-files',
+        action='store_true',
+        help='With --remove-feed, also delete episode files on disk',
+    )
+    parser.add_argument(
+        '--export-opml', default=None, metavar='FILE', help='Export feeds to OPML file and exit'
+    )
+    parser.add_argument(
+        '--import-opml', default=None, metavar='FILE', help='Import feeds from OPML file and exit'
+    )
+    parser.add_argument('--config', default=None, metavar='FILE', help='Config file path (TOML)')
+    parser.add_argument('--no-config', action='store_true', help='Disable config file loading')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
+    # Load config file before final parse so CLI overrides config
+    # Peek sys.argv for --config / --no-config
+    _explicit_cfg = None
+    _no_cfg = '--no-config' in sys.argv
+    _has_config_flag = any(a == '--config' or a.startswith('--config=') for a in sys.argv)
+    if _has_config_flag and _no_cfg:
+        parser.error('--config and --no-config are mutually exclusive')
+    if not _no_cfg:
+        for _i, _a in enumerate(sys.argv):
+            if _a == '--config':
+                if _i + 1 >= len(sys.argv) or sys.argv[_i + 1].startswith('--'):
+                    parser.error('--config requires a file path')
+                _explicit_cfg = sys.argv[_i + 1]
+                break
+            if _a.startswith('--config='):
+                val = _a.split('=', 1)[1]
+                if not val:
+                    parser.error('--config requires a file path')
+                _explicit_cfg = val
+                break
+        _cfg_path = find_config_path(_explicit_cfg, no_config=_no_cfg)
+        if _explicit_cfg and _cfg_path and not _cfg_path.exists():
+            parser.error(f'Config file not found: {_explicit_cfg}')
+        _cfg = load_config(_cfg_path)
+        if _cfg:
+            # Only non-positional dests (exclude feed_id/save_dir)
+            _allowed = {
+                'keep',
+                'max_age',
+                'max_size',
+                'verbose',
+                'quiet',
+                'save_text',
+                'num_episodes',
+                'since',
+                'all',
+                'keep_last',
+                'dry_run',
+            }
+            _filtered = {k: v for k, v in _cfg.items() if k in _allowed}
+            if _filtered:
+                parser.set_defaults(**_filtered)
+                logging.debug('Loaded config %s: %s', _cfg_path, _filtered)
+
     args = parser.parse_args()
+
+    # Configure logging verbosity (default INFO).
+    if args.verbose and args.quiet:
+        parser.error('--verbose and --quiet are mutually exclusive')
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    elif args.quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+
+    # Validate retention flags
+    if args.keep is not None and args.keep_last:
+        parser.error('--keep and --keep-last are mutually exclusive')
+    if args.keep is not None and args.keep < 1:
+        parser.error(f'--keep must be a positive integer (got {args.keep})')
+    max_age_delta = None
+    if args.max_age:
+        try:
+            max_age_delta = parse_max_age(args.max_age)
+        except ValueError as e:
+            parser.error(str(e))
+    max_size_bytes = None
+    if args.max_size:
+        try:
+            max_size_bytes = parse_size(args.max_size)
+        except ValueError as e:
+            parser.error(str(e))
+        if max_size_bytes < 1:
+            parser.error('--max-size must be >=1 byte')
+
+    if args.delete_files and args.remove_feed is None:
+        parser.error('--delete-files requires --remove-feed')
 
     if args.list_feeds:
         list_feeds()
         return
 
     db_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'downloads.db')
+
+    if args.remove_feed is not None:
+        conn = setup_database(db_path)
+        try:
+            ok = remove_feed(conn, args.remove_feed, delete_files=args.delete_files)
+        finally:
+            conn.close()
+        if not ok:
+            parser.error(f'No feed found with id {args.remove_feed}')
+        print(f'Removed feed {args.remove_feed}')
+        return
+
+    if args.export_opml:
+        count = export_opml(db_path, args.export_opml)
+        print(f'Exported {count} feed(s) to {args.export_opml}')
+        return
+
+    if args.import_opml:
+        imported, skipped = import_opml(db_path, args.import_opml)
+        print(f'Imported {imported} feed(s), skipped {skipped} existing')
+        return
 
     # Parse --since into a naive datetime (midnight local) for comparison.
     since_date = None
@@ -836,9 +1436,25 @@ def main():
                 feed=feed,
                 since=since_date,
                 full_history=args.all,
+                dry_run=args.dry_run,
             )
-            if args.keep_last:
-                prune_to_keep_last(conn, feed_id, args.save_dir)
+            # Retention pruning (flexible or legacy keep-last)
+            if (
+                args.keep is not None
+                or args.keep_last
+                or max_age_delta is not None
+                or max_size_bytes is not None
+            ):
+                keep_n = args.keep if args.keep is not None else (1 if args.keep_last else None)
+                prune_feed(
+                    conn,
+                    feed_id,
+                    args.save_dir,
+                    keep=keep_n,
+                    max_age=max_age_delta,
+                    max_size=max_size_bytes,
+                    dry_run=args.dry_run,
+                )
     except Exception as e:
         logging.error('An unexpected error occurred: %s', e, exc_info=True)
     finally:
