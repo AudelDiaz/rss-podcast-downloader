@@ -21,7 +21,7 @@ A local SQLite database (`downloads.db`) is created in the script's directory to
 - **Retention & Pruning**: `--keep N` / `--max-age 30d` / `--max-size 2G` to cap disk usage per feed (see `docs/specs/retention.md`).
 - **Feed CRUD + OPML**: `--remove-feed` / `--export-opml` / `--import-opml` for backup/migration.
 - **Config File**: TOML `rss-podcast-downloader.toml` (`[defaults]`) with CLI override (see `config.example.toml`).
-- **Robust Sync UX**: `--dry-run` preview, `audio/*` + `video/mp4` enclosures, anti-colisión `_<n>`, `--verbose/--quiet`.
+- **Robust Sync UX**: `--dry-run` preview, `audio/*` + `video/mp4` enclosures, anti-collision `_<n>`, `--verbose/--quiet`.
 - **Command-Line Interface**: Simple CLI for specifying the RSS feed URL and save directory.
 - **Error Handling**: Provides clear error messages and retry logic for downloads.
 
@@ -73,14 +73,14 @@ python rss-podcast-downloader.py <RSS_FEED_URL> <SAVE_DIRECTORY> [OPTIONS]
 - `<RSS_FEED_URL>`: The URL of the podcast's RSS feed. (Required)
 - `<SAVE_DIRECTORY>`: The local directory where podcast files will be saved. (Required)
 
-### Options (principales)
+### Options
 
 - `--num-episodes <N>`: Check only the `<N>` most recent episodes in the feed for new downloads. This is useful for quickly syncing the latest episodes without checking the entire feed history.
 - `--save_text`: Flag to save additional episode details (like the summary) in a separate `.txt` file alongside the audio file.
-- `--keep N` / `--max-age 30d` / `--max-size 2G`: Retention pruning (ver `docs/specs/retention.md`).
-- `--remove-feed ID` / `--export-opml FILE` / `--import-opml FILE`: Gestión de feeds.
-- `--dry-run`: Preview sin descargar. `--verbose`/`--quiet`: Control de log. `--version`: Muestra versión.
-- `--config FILE` / `--no-config`: Sobrescribe/deshabilita `rss-podcast-downloader.toml`.
+- `--keep N` / `--max-age 30d` / `--max-size 2G`: Retention pruning (see `docs/specs/retention.md`).
+- `--remove-feed ID` / `--export-opml FILE` / `--import-opml FILE`: Feed management.
+- `--dry-run`: Preview without downloading. `--verbose`/`--quiet`: Log control. `--version`: Shows version.
+- `--config FILE` / `--no-config`: Overrides/disables `rss-podcast-downloader.toml`.
 
 ## Examples
 

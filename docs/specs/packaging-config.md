@@ -1,20 +1,20 @@
-# Feature: Empaquetado Instalable + Archivo Config
+# Feature: Installable Package + Config File
 
 ## Problem Statement
-Hoy es un script con guion `python rss-podcast-downloader.py URL dir` y `requirements.txt` sin `[project]`. No es instalable vía `pipx`/`uv tool`, no expone `console_scripts`, y obliga a repetir `URL save_dir --flags` en cada cron/systemd/Docker.
+Today it is a script invoked as `python rss-podcast-downloader.py URL dir` with `requirements.txt` and no `[project]`. It is not installable via `pipx`/`uv tool`, does not expose `console_scripts`, and forces repeating `URL save_dir --flags` on every cron/systemd/Docker invocation.
 
 ## Background
-- Single-file CLI `rss-podcast-downloader.py` (hyphen) no es importable como módulo.
-- `pyproject.toml` solo tiene `[tool.ruff]`/`[tool.pytest]`; sin `[project]`/`[build-system]`.
-- No hay config file; flags deben repetirse. Stack usa `uv` y Python 3.14 (tomllib disponible).
+- Single-file CLI `rss-podcast-downloader.py` (hyphen) is not importable as a module.
+- `pyproject.toml` only has `[tool.ruff]`/`[tool.pytest]`; no `[project]`/`[build-system]`.
+- No config file; flags must be repeated. Stack uses `uv` and Python 3.14 (tomllib available).
 
 ## Requirements
-- **REQ-1: Packaging** — Añadir `[project]` (name `rss-podcast-downloader`, version `1.1.0`, deps `requests`, `feedparser`, `mutagen`), `[build-system]` (hatchling), `[project.scripts]` `rss-podcast-downloader = rss_podcast_downloader:main`.
-- **REQ-2: Shim importable** — Crear `rss_podcast_downloader.py` (underscore) importable que re-exporta `main` y API pública cargando dinámicamente `rss-podcast-downloader.py` (evita duplicar 1000 líneas; mantiene compat backward con invocación `python rss-podcast-downloader.py`).
-- **REQ-3: Config file** — Soportar `TOML` en prioridad: `--config FILE` explícito > `./rss-podcast-downloader.toml` > `$XDG_CONFIG_HOME/rss-podcast-downloader/config.toml` > `~/.config/rss-podcast-downloader/config.toml`. Si no existe, sin error.
-- **REQ-4: Config schema** — Sección `[defaults]` con claves mapeadas a flags: `save_dir`, `keep`, `max_age`, `max_size`, `verbose`, `quiet`, `save_text`, `num_episodes`, `since`, `all`. Valores CLI siempre override config.
-- **REQ-5: CLI `--config` / `--no-config`** — `--config FILE` fuerza path; `--no-config` deshabilita carga.
-- **REQ-6: Compat** — Instalación `pip install .` o `uv tool install .` debe crear bin `rss-podcast-downloader` que funciona sin `python` prefix; `python rss-podcast-downloader.py` sigue funcionando.
+- **REQ-1: Packaging** — Add `[project]` (name `rss-podcast-downloader`, version `1.1.0`, deps `requests`, `feedparser`, `mutagen`), `[build-system]` (hatchling), `[project.scripts]` `rss-podcast-downloader = rss_podcast_downloader:main`.
+- **REQ-2: Importable shim** — Create `rss_podcast_downloader.py` (underscore) importable that re-exports `main` and public API by dynamically loading `rss-podcast-downloader.py` (avoids duplicating 1000 lines; keeps backward compat with `python rss-podcast-downloader.py`).
+- **REQ-3: Config file** — Support `TOML` with priority: explicit `--config FILE` > `./rss-podcast-downloader.toml` > `$XDG_CONFIG_HOME/rss-podcast-downloader/config.toml` > `~/.config/rss-podcast-downloader/config.toml`. If not exists, no error.
+- **REQ-4: Config schema** — Section `[defaults]` with keys mapped to flags: `save_dir`, `keep`, `max_age`, `max_size`, `verbose`, `quiet`, `save_text`, `num_episodes`, `since`, `all`. CLI values always override config.
+- **REQ-5: CLI `--config` / `--no-config`** — `--config FILE` forces path; `--no-config` disables loading.
+- **REQ-6: Compat** — Installation `pip install .` or `uv tool install .` must create bin `rss-podcast-downloader` working without `python` prefix; `python rss-podcast-downloader.py` keeps working.
 
 ### Scenarios
 ```gherkin
@@ -24,16 +24,16 @@ Feature: install
     Then command rss-podcast-downloader --help works
 
 Feature: config
-  Scenario: defaults desde fichero
-    Given ./rss-podcast-downloader.toml con [defaults] keep=5
-    When rss-podcast-downloader <url> <dir> (sin --keep)
-    Then keep=5 se aplica
+  Scenario: defaults from file
+    Given ./rss-podcast-downloader.toml with [defaults] keep=5
+    When rss-podcast-downloader <url> <dir> (without --keep)
+    Then keep=5 is applied
     When rss-podcast-downloader <url> <dir> --keep 2
-    Then CLI override a 2
+    Then CLI overrides to 2
 
-  Scenario: --no-config ignora fichero
+  Scenario: --no-config ignores file
     When --no-config
-    Then config no se carga
+    Then config is not loaded
 ```
 
 ## Architecture
@@ -66,9 +66,9 @@ main = _mod.main
 ```
 
 ### Config loader
-- `find_config_path(explicit=None, no_config=False) -> Path|None` — resuelve prioridad.
-- `load_config(path) -> dict` — usa `tomllib` (py314) fallback `tomli`; retorna `{}` si missing; log warning si parse error.
-- En `main()`, antes de `parser.parse_args()`, cargar config, luego `parser.set_defaults(**config_defaults)` para que CLI override.
+- `find_config_path(explicit=None, no_config=False) -> Path|None` — resolves priority.
+- `load_config(path) -> dict` — uses `tomllib` (py314) fallback `tomli`; returns `{}` if missing; logs warning if parse error.
+- In `main()`, before `parser.parse_args()`, load config, then `parser.set_defaults(**config_defaults)` so CLI overrides.
 
 ## API / Interface
 - `find_config_path`, `load_config`, `get_config_defaults`
@@ -79,5 +79,5 @@ main = _mod.main
 - Integration: `pip install` smoke (help).
 
 ## Out of Scope
-- Migración de DB a config.
-- Soporte YAML (solo TOML stdlib).
+- Migration of DB to config.
+- YAML support (only TOML stdlib).
