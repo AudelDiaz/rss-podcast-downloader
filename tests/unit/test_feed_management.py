@@ -63,6 +63,45 @@ def test_select_candidates_keeps_dateless_when_incremental(mod):
     assert 'e-2020' in titles
 
 
+def test_select_candidates_since_window_new_feed(mod):
+    """--since keeps only episodes published on/after the date (new feed)."""
+    eps = [_mk_pair('e-2001', 2001), _mk_pair('e-2010', 2010), _mk_pair('e-2020', 2020)]
+    since = mod._parse_date('2010-06-01')
+    sel = mod._select_candidates(eps, None, since=since)
+    # e-2010 publishes 2010-01-01, before the 2010-06-01 cutoff -> excluded.
+    assert [p[0]['title'] for p in sel] == ['e-2020']
+
+
+def test_select_candidates_since_boundary_inclusive(mod):
+    eps = [_mk_pair('e-2020', 2020), _mk_pair('e-2010', 2010)]
+    since = mod._parse_date('2020-01-01')  # equal to e-2020 publish -> inclusive
+    sel = mod._select_candidates(eps, None, since=since)
+    assert [p[0]['title'] for p in sel] == ['e-2020']
+
+
+def test_select_candidates_since_and_num_episodes(mod):
+    eps = [_mk_pair('e-2001', 2001), _mk_pair('e-2010', 2010), _mk_pair('e-2020', 2020)]
+    since = mod._parse_date('2005-01-01')
+    sel = mod._select_candidates(eps, None, num_episodes=1, since=since)
+    assert [p[0]['title'] for p in sel] == ['e-2020']
+
+
+def test_select_candidates_full_history_new_feed(mod):
+    eps = [_mk_pair('e-2001', 2001), _mk_pair('e-2020', 2020)]
+    sel = mod._select_candidates(eps, None, full_history=True)
+    assert len(sel) == 2
+
+
+def test_select_candidates_established_feed_ignores_since_older_than_owned(mod):
+    """On an established feed, --since earlier than the newest-owned still yields nothing new."""
+    eps = [_mk_pair('e-2010', 2010), _mk_pair('e-2020', 2020)]
+    # feed owns newest at 2020
+    last = mod._parse_date('2020-01-01T12:00:00')
+    since = mod._parse_date('2015-01-01')  # earlier than owned -> no strictly-newer episodes
+    sel = mod._select_candidates(eps, last, since=since)
+    assert sel == []
+
+
 def test_get_last_downloaded_date_empty(mod, tmp_path):
     conn = mod.setup_database(str(tmp_path / 't.db'))
     feed_id = mod.get_or_create_feed(conn, 'http://a.com/feed', 'A')
