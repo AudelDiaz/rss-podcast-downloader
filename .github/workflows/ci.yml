@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  lint-and-unit:
+    name: Lint + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Create env and install deps
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python -r requirements.txt
+          uv pip install --python .venv/bin/python pytest ruff
+      - name: Lint
+        run: .venv/bin/python -m ruff check . && .venv/bin/python -m ruff format --check .
+      - name: Unit tests
+        run: .venv/bin/python -m pytest tests/unit -v
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Create env and install deps
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python -r requirements.txt
+          uv pip install --python .venv/bin/python pytest ruff
+      - name: Integration tests
+        run: .venv/bin/python -m pytest tests/integration -v

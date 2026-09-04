@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+testpaths = ["tests/unit", "tests/integration"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short -p no:cacheprovider"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RET"]
+
+[tool.ruff.format]
+quote-style = "single"
