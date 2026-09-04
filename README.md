@@ -81,3 +81,33 @@ python rss-podcast-downloader.py "http://example.com/podcast.rss" "./podcasts/My
 ```bash
 python rss-podcast-downloader.py "http://another-feed.com/rss" "./podcasts/AnotherShow" --save_text
 ```
+
+## Development
+
+This project uses [uv](https://docs.astral.sh/uv/) for environment and tooling.
+
+```bash
+uv venv .venv                       # create the environment
+uv pip install -r requirements.txt  # runtime dependencies
+uv pip install pytest ruff          # dev dependencies
+```
+
+Run the test suite (unit on every change, integration for full coverage):
+
+```bash
+uv run pytest tests/unit -v        # fast, no network/DB
+uv run pytest tests/integration -v # real local HTTP server + DB
+```
+
+Lint and format:
+
+```bash
+uv run ruff check .
+uv run ruff format --check .
+```
+
+### Specs
+
+Design and hardening specs live in [`docs/specs/`](docs/specs/). See
+[`docs/specs/rss-hardening.md`](docs/specs/rss-hardening.md) for the current
+code-quality hardening work.
