@@ -14,13 +14,19 @@ import sys
 _HYPHEN = pathlib.Path(__file__).with_name('rss-podcast-downloader.py')
 if not _HYPHEN.exists():
     _HYPHEN = pathlib.Path(__file__).parent / 'rss-podcast-downloader.py'
+if not _HYPHEN.exists():
+    raise FileNotFoundError(f'Hyphen script not found: {_HYPHEN} (required for shim)')
 
 _spec = importlib.util.spec_from_file_location('rpd_impl', _HYPHEN)
+if _spec is None or _spec.loader is None:
+    raise ImportError(f'Cannot load spec for {_HYPHEN}')
 _mod = importlib.util.module_from_spec(_spec)
 sys.modules['rpd_impl'] = _mod
 _spec.loader.exec_module(_mod)  # type: ignore[attr-defined]
 
-__version__ = getattr(_mod, '__version__', '0.0.0')
+__version__ = getattr(_mod, '__version__', None)
+if __version__ is None:
+    raise ImportError(f'__version__ not found in {_HYPHEN}')
 
 # Re-export public API
 main = _mod.main

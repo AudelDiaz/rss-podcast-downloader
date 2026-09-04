@@ -9,7 +9,7 @@ Hoy es un script con guion `python rss-podcast-downloader.py URL dir` y `require
 - No hay config file; flags deben repetirse. Stack usa `uv` y Python 3.14 (tomllib disponible).
 
 ## Requirements
-- **REQ-1: Packaging** — Añadir `[project]` (name `rss-podcast-downloader`, version `1.0.0`, deps `requests`, `feedparser`, `mutagen`), `[build-system]` (hatchling o setuptools), `[project.scripts]` `rss-podcast-downloader = rss_podcast_downloader:main`.
+- **REQ-1: Packaging** — Añadir `[project]` (name `rss-podcast-downloader`, version `1.1.0`, deps `requests`, `feedparser`, `mutagen`), `[build-system]` (hatchling), `[project.scripts]` `rss-podcast-downloader = rss_podcast_downloader:main`.
 - **REQ-2: Shim importable** — Crear `rss_podcast_downloader.py` (underscore) importable que re-exporta `main` y API pública cargando dinámicamente `rss-podcast-downloader.py` (evita duplicar 1000 líneas; mantiene compat backward con invocación `python rss-podcast-downloader.py`).
 - **REQ-3: Config file** — Soportar `TOML` en prioridad: `--config FILE` explícito > `./rss-podcast-downloader.toml` > `$XDG_CONFIG_HOME/rss-podcast-downloader/config.toml` > `~/.config/rss-podcast-downloader/config.toml`. Si no existe, sin error.
 - **REQ-4: Config schema** — Sección `[defaults]` con claves mapeadas a flags: `save_dir`, `keep`, `max_age`, `max_size`, `verbose`, `quiet`, `save_text`, `num_episodes`, `since`, `all`. Valores CLI siempre override config.
@@ -41,7 +41,7 @@ Feature: config
 ```toml
 [project]
 name = "rss-podcast-downloader"
-version = "1.0.0"
+version = "1.1.0"
 requires-python = ">=3.10"
 dependencies = ["requests==2.32.0","feedparser==6.0.11","mutagen==1.48.1","certifi","charset-normalizer","idna","urllib3","sgmllib3k"]
 [project.scripts]

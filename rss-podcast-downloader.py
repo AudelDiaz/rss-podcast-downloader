@@ -68,23 +68,23 @@ __version__ = '1.1.0'
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-USER_AGENT = f'rss-podcast-downloader/{__version__} (+https://github.com/johnsosoka/rss-podcast-downloader)'
+USER_AGENT = (
+    f'rss-podcast-downloader/{__version__} (+https://github.com/johnsosoka/rss-podcast-downloader)'
+)
 
 
 def find_config_path(explicit=None, no_config=False):
     """Resolve config file path by priority.
 
-    Priority: explicit > ./rss-podcast-downloader.toml > XDG > ~/.config/...
+    Priority: explicit > ./rss-podcast-downloader.toml (cwd) > XDG > ~/.config/...
     Returns Path or None.
     """
     if no_config:
         return None
     if explicit:
-        p = Path(explicit).expanduser()
-        return p if p.exists() and p.is_file() else p
+        return Path(explicit).expanduser()
     candidates = [
         Path.cwd() / 'rss-podcast-downloader.toml',
-        Path(__file__).parent / 'rss-podcast-downloader.toml',
     ]
     xdg = os.environ.get('XDG_CONFIG_HOME')
     if xdg:
@@ -122,9 +122,8 @@ def load_config(path=None):
         return {}
     if 'defaults' in data and isinstance(data['defaults'], dict):
         return dict(data['defaults'])
-    # Fallback: top-level scalar keys
+    # Fallback: top-level scalar keys (only non-positional, to avoid surprising auto-selection)
     known = {
-        'save_dir',
         'keep',
         'max_age',
         'max_size',
@@ -139,13 +138,11 @@ def load_config(path=None):
     }
     result = {}
     for k, v in data.items():
+        if isinstance(v, dict):
+            continue
         nk = k.replace('-', '_')
         if nk in known:
             result[nk] = v
-        elif isinstance(v, dict):
-            continue
-        elif k in known:
-            result[k] = v
     return result
 
 
@@ -516,8 +513,8 @@ def remove_feed(conn, feed_id, delete_files=False):
 
     cursor.execute('DELETE FROM episodes WHERE feed_id = ?', (feed_id,))
     cursor.execute('DELETE FROM feeds WHERE feed_id = ?', (feed_id,))
-    conn.commit()
 
+    # Best-effort file removal before commit (so DB and files stay closer to atomic)
     if delete_files and save_dir and filepaths:
         abs_save = os.path.abspath(save_dir)
         for fp in filepaths:
@@ -528,6 +525,8 @@ def remove_feed(conn, feed_id, delete_files=False):
                     logging.info('Removed file for deleted feed %s: %s', feed_id, fp)
             except (OSError, ValueError):
                 pass
+
+    conn.commit()
     logging.info(
         'Removed feed %s (%s episode(s))', feed_id, len(filepaths) if delete_files else 'unknown'
     )
@@ -540,11 +539,32 @@ def export_opml(db_path=None, output_path=None):
 
     if output_path is None:
         raise ValueError('output_path required')
-    conn = setup_database(db_path)
-    try:
-        rows = conn.execute('SELECT feed_url, feed_title FROM feeds ORDER BY feed_id').fetchall()
-    finally:
-        conn.close()
+    # Avoid creating a stray DB on read-only export (review finding)
+    if db_path is not None:
+        if not Path(db_path).exists():
+            rows = []
+        else:
+            conn = setup_database(db_path)
+            try:
+                rows = conn.execute(
+                    'SELECT feed_url, feed_title FROM feeds ORDER BY feed_id'
+                ).fetchall()
+            finally:
+                conn.close()
+    else:
+        default_path = Path(
+            os.path.join(os.path.dirname(os.path.realpath(__file__)), 'downloads.db')
+        )
+        if not default_path.exists():
+            rows = []
+        else:
+            conn = setup_database(db_path)
+            try:
+                rows = conn.execute(
+                    'SELECT feed_url, feed_title FROM feeds ORDER BY feed_id'
+                ).fetchall()
+            finally:
+                conn.close()
 
     opml = ET.Element('opml', version='2.0')
     head = ET.SubElement(opml, 'head')
@@ -576,10 +596,14 @@ def import_opml(db_path=None, input_path=None):
         raise FileNotFoundError(f'OPML file not found: {input_path}')
     tree = ET.parse(input_path)
     root = tree.getroot()
-    # Collect all outline elements with xmlUrl (recursively)
+    # Collect all outline elements with xmlUrl (case-insensitive, recursively)
     urls = []
     for outline in root.iter('outline'):
-        xml_url = outline.get('xmlUrl') or outline.get('xmlurl')
+        xml_url = None
+        for k, v in outline.attrib.items():
+            if k.lower() == 'xmlurl':
+                xml_url = v
+                break
         if xml_url:
             title = outline.get('text') or outline.get('title') or xml_url
             urls.append((xml_url.strip(), title.strip()))
@@ -592,17 +616,27 @@ def import_opml(db_path=None, input_path=None):
     imported = 0
     skipped = 0
     try:
+        # Build normalized existing set to catch duplicates with trailing slash / case
+        existing_rows = conn.execute('SELECT feed_url FROM feeds').fetchall()
+        existing_norm = {r[0].strip().rstrip('/').lower() for r in existing_rows if r[0]}
+
         for feed_url, feed_title in urls:
+            norm = feed_url.strip().rstrip('/').lower()
+            if norm in existing_norm:
+                skipped += 1
+                continue
             cursor = conn.cursor()
             cursor.execute('SELECT feed_id FROM feeds WHERE feed_url = ?', (feed_url,))
             if cursor.fetchone():
                 skipped += 1
+                existing_norm.add(norm)
                 continue
             cursor.execute(
                 'INSERT INTO feeds (feed_url, feed_title) VALUES (?, ?)',
                 (feed_url, feed_title),
             )
             imported += 1
+            existing_norm.add(norm)
         conn.commit()
     finally:
         conn.close()
@@ -747,11 +781,11 @@ def prune_feed(conn, feed_id, save_dir, keep=None, max_age=None, max_size=None, 
     if not rows:
         return (0, 0)
 
-    # Normalize max_age to cutoff datetime
+    # Normalize max_age to cutoff datetime (use UTC to match stored naive UTC)
     cutoff = None
     if max_age is not None:
         if isinstance(max_age, timedelta):
-            cutoff = datetime.now() - max_age
+            cutoff = datetime.utcnow() - max_age
         elif isinstance(max_age, datetime):
             cutoff = max_age
         else:
@@ -917,14 +951,14 @@ def _is_audio_enclosure(link):
 
     Accepts any ``audio/*`` type (covers audio/mpeg, audio/mp3, audio/mp4,
     audio/x-mpeg, audio/ogg…) plus ``video/mp4``/``video/mpeg`` which some
-    feeds use for video podcasts. Falls back to extension check when type is
+    feeds use for video podcasts. Falls back to extension check only when type is
     missing/empty.
     """
     t = getattr(link, 'type', None) or ''
     t = t.lower().strip()
-    if t.startswith('audio/') or t in ('video/mp4', 'video/mpeg'):
-        return True
-    # Fallback: URL with known audio/video extension even if type is absent.
+    if t:
+        return t.startswith('audio/') or t in ('video/mp4', 'video/mpeg')
+    # Fallback: URL with known audio/video extension only when type is absent.
     href = getattr(link, 'href', '') or ''
     _, ext = os.path.splitext(urlparse(unquote(href)).path)
     return ext.lower() in ('.mp3', '.m4a', '.mp4', '.ogg', '.opus', '.flac', '.wav', '.aac')
@@ -941,9 +975,15 @@ def _unique_filepath(save_dir, basename, ext):
         if not os.path.exists(candidate):
             return candidate
         counter += 1
-        # Safety cap — should never hit in practice.
         if counter > 1000:
-            return candidate
+            # Pathological collision (1000 same names) — use uuid to avoid overwrite
+            import uuid
+
+            candidate = os.path.join(save_dir, f'{basename}_{uuid.uuid4().hex[:8]}{ext}')
+            if not os.path.exists(candidate):
+                return candidate
+            # If even uuid collides (extremely unlikely), keep trying
+            continue
 
 
 def _episode_sort_key(entry_link):
@@ -1053,7 +1093,27 @@ def parse_and_download(
             logging.info('DRY-RUN: would download %s episode(s):', total_to_download)
             for entry, link in episodes_to_download:
                 fn = sanitize_filename_from_entry(entry)
-                logging.info('  - %s  [%s]', fn, link.href)
+                if len(fn) > 200:
+                    fn = fn[:200].rstrip('_-')
+                if not fn:
+                    fn = 'untitled'
+                parsed = urlparse(unquote(link.href))
+                _, ext = os.path.splitext(parsed.path)
+                if not ext:
+                    lt = (getattr(link, 'type', '') or '').lower()
+                    if lt.startswith('audio/'):
+                        ext = '.mp3'
+                    elif lt.startswith('video/'):
+                        ext = '.mp4'
+                    else:
+                        ext = '.mp3'
+                # Show what file would be (with unique suffix if collision)
+                preview = (
+                    _unique_filepath(save_dir, fn, ext)
+                    if os.path.exists(os.path.join(save_dir, fn + ext))
+                    else os.path.join(save_dir, fn + ext)
+                )
+                logging.info('  - %s  [%s] -> %s', fn, link.href, preview)
         return
 
     successful_downloads = 0
@@ -1062,6 +1122,8 @@ def parse_and_download(
         # Guard against filesystem limits (255 char filename, 260+ path).
         if len(filename) > 200:
             filename = filename[:200].rstrip('_-')
+        if not filename:
+            filename = 'untitled'
 
         # Resolve the file extension from the URL, defaulting based on MIME.
         parsed_url = urlparse(unquote(link.href))
@@ -1209,20 +1271,29 @@ def main():
     # Peek sys.argv for --config / --no-config
     _explicit_cfg = None
     _no_cfg = '--no-config' in sys.argv
+    _has_config_flag = any(a == '--config' or a.startswith('--config=') for a in sys.argv)
+    if _has_config_flag and _no_cfg:
+        parser.error('--config and --no-config are mutually exclusive')
     if not _no_cfg:
         for _i, _a in enumerate(sys.argv):
-            if _a == '--config' and _i + 1 < len(sys.argv):
+            if _a == '--config':
+                if _i + 1 >= len(sys.argv) or sys.argv[_i + 1].startswith('--'):
+                    parser.error('--config requires a file path')
                 _explicit_cfg = sys.argv[_i + 1]
                 break
             if _a.startswith('--config='):
-                _explicit_cfg = _a.split('=', 1)[1]
+                val = _a.split('=', 1)[1]
+                if not val:
+                    parser.error('--config requires a file path')
+                _explicit_cfg = val
                 break
         _cfg_path = find_config_path(_explicit_cfg, no_config=_no_cfg)
+        if _explicit_cfg and _cfg_path and not _cfg_path.exists():
+            parser.error(f'Config file not found: {_explicit_cfg}')
         _cfg = load_config(_cfg_path)
         if _cfg:
-            # Only apply known dest names
+            # Only non-positional dests (exclude feed_id/save_dir)
             _allowed = {
-                'save_dir',
                 'keep',
                 'max_age',
                 'max_size',
@@ -1234,7 +1305,6 @@ def main():
                 'all',
                 'keep_last',
                 'dry_run',
-                'feed_id',
             }
             _filtered = {k: v for k, v in _cfg.items() if k in _allowed}
             if _filtered:
