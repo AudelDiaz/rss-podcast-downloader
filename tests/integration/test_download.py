@@ -1,6 +1,7 @@
 """Integration tests: end-to-end download against a local HTTP fixture server."""
 
 import threading
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -92,7 +93,7 @@ def test_end_to_end_downloads_and_dedups(mod, http_server, tmp_path):
     conn = mod.setup_database(str(db_path))
     feed_id = mod.get_or_create_feed(conn, f'{http_server}/feed.xml', feed.feed.get('title', 'N/A'))
 
-    # First pass: both episodes downloaded.
+    # First pass: both episodes downloaded (fresh feed -> full_history).
     mod.parse_and_download(
         str(save_dir),
         False,
@@ -100,6 +101,7 @@ def test_end_to_end_downloads_and_dedups(mod, http_server, tmp_path):
         conn=conn,
         feed_id=feed_id,
         feed=feed,
+        full_history=True,
     )
     assert _FeedHandler.download_count == {'ep-newest.mp3': 1, 'ep-older.mp3': 1}
     files = sorted(p.name for p in save_dir.iterdir())
@@ -202,4 +204,76 @@ def test_incremental_sync_fully_caught_up_downloads_nothing(mod, http_server, tm
 
     assert _FeedHandler.download_count == {'ep-newest.mp3': 0, 'ep-older.mp3': 0}
     assert sorted(p.name for p in save_dir.iterdir()) == []
+    conn.close()
+
+
+def test_new_feed_no_controls_downloads_nothing(mod, http_server, tmp_path):
+    """A fresh feed with no --num-episodes/--since/--all must download nothing."""
+    save_dir = tmp_path / 'podcasts'
+    save_dir.mkdir()
+    db_path = tmp_path / 'test.db'
+
+    feed = _feed(mod, http_server)
+    conn = mod.setup_database(str(db_path))
+    feed_id = mod.get_or_create_feed(conn, f'{http_server}/feed.xml', feed.feed.get('title', 'N/A'))
+
+    mod.parse_and_download(str(save_dir), False, None, conn=conn, feed_id=feed_id, feed=feed)
+
+    assert _FeedHandler.download_count == {'ep-newest.mp3': 0, 'ep-older.mp3': 0}
+    assert sorted(p.name for p in save_dir.iterdir()) == []
+    conn.close()
+
+
+def test_new_feed_since_seeds_date_window(mod, http_server, tmp_path):
+    """--since on a fresh feed downloads only episodes from that date on."""
+    save_dir = tmp_path / 'podcasts'
+    save_dir.mkdir()
+    db_path = tmp_path / 'test.db'
+
+    feed = _feed(mod, http_server)
+    conn = mod.setup_database(str(db_path))
+    feed_id = mod.get_or_create_feed(conn, f'{http_server}/feed.xml', feed.feed.get('title', 'N/A'))
+
+    # newest publishes 2002-10-02, older 2002-10-01. since 2002-10-02 -> only newest.
+    since = datetime(2002, 10, 2)
+    mod.parse_and_download(
+        str(save_dir), False, None, conn=conn, feed_id=feed_id, feed=feed, since=since
+    )
+
+    assert _FeedHandler.download_count == {'ep-newest.mp3': 1, 'ep-older.mp3': 0}
+    assert sorted(p.name for p in save_dir.iterdir()) == ['2002-10-02_newest_episode.mp3']
+    conn.close()
+
+
+def test_dateless_established_feed_not_blocked_by_guard(mod, http_server, tmp_path):
+    """A feed that owns only dateless episodes must NOT be treated as brand-new.
+
+    Regression: the guard keys off whether the feed has ANY rows, not off a dated
+    anchor, so an all-dateless feed can still do incremental catch-up on a bare run.
+    """
+    save_dir = tmp_path / 'podcasts'
+    save_dir.mkdir()
+    db_path = tmp_path / 'test.db'
+
+    feed = _feed(mod, http_server)
+    conn = mod.setup_database(str(db_path))
+    feed_id = mod.get_or_create_feed(conn, f'{http_server}/feed.xml', feed.feed.get('title', 'N/A'))
+
+    # Seed the feed with one dateless (empty published) episode row, distinct guid.
+    conn.execute(
+        'INSERT INTO episodes (feed_id, guid, title, published, filepath, downloaded_at) '
+        "VALUES (?, ?, ?, '', ?, ?)",
+        (feed_id, 'already-done-dateless', 'old dateless', '/x/old.mp3', 'now'),
+    )
+    conn.commit()
+
+    # A bare run must proceed (feed is established via rows) and download the
+    # real dated episodes (2 of them), not be blocked by the new-feed guard.
+    mod.parse_and_download(str(save_dir), False, None, conn=conn, feed_id=feed_id, feed=feed)
+
+    assert _FeedHandler.download_count == {'ep-newest.mp3': 1, 'ep-older.mp3': 1}
+    assert sorted(p.name for p in save_dir.iterdir()) == [
+        '2002-10-01_older_episode.mp3',
+        '2002-10-02_newest_episode.mp3',
+    ]
     conn.close()

@@ -17,7 +17,12 @@ Options:
     --list-feeds       List all feeds in the database (with their save dirs) and exit.
     --keep-last        Keep only the newest episode per feed after downloading.
     --num-episodes N   Only consider N episodes published after the last download.
+    --since DATE       Only consider episodes published on/after DATE (YYYY-MM-DD).
+    --all              On a feed with no prior downloads, download the full archive.
     --save_text        Also save a .txt sidecar with episode details.
+
+A feed with no prior downloads requires one of --num-episodes, --since, or --all;
+otherwise nothing is downloaded.
 
 Example:
     python rss-podcast-downloader.py http://example.com/podcast.rss ./podcasts/MyShow
@@ -392,7 +397,9 @@ def get_feed_url_by_id(conn, feed_id):
 def _get_last_downloaded_date(conn, feed_id):
     """Return the newest ``published`` datetime already downloaded for a feed.
 
-    Returns None when no episodes have been downloaded for the feed yet.
+    Returns None when no dated episodes have been downloaded for the feed yet.
+    (An all-dateless feed has no dated anchor; use :func:`_feed_has_episodes`
+    to distinguish that from a truly brand-new feed.)
     """
     cursor = conn.cursor()
     cursor.execute(
@@ -409,34 +416,61 @@ def _get_last_downloaded_date(conn, feed_id):
         return None
 
 
-def _select_candidates(all_episodes, last_downloaded, num_episodes=None):
+def _feed_has_episodes(conn, feed_id):
+    """Return True if the feed has ANY downloaded episode rows (dated or not)."""
+    cursor = conn.cursor()
+    cursor.execute('SELECT 1 FROM episodes WHERE feed_id = ? LIMIT 1', (feed_id,))
+    return cursor.fetchone() is not None
+
+
+def _select_candidates(
+    all_episodes,
+    last_downloaded=None,
+    num_episodes=None,
+    since=None,
+):
     """Pick the (entry, link) pairs this run should consider downloading.
 
-    ``all_episodes`` are audio/mpeg (entry, link) pairs from the feed. When
-    ``last_downloaded`` is not None, only episodes published strictly after it
-    are candidates (incremental catch-up). When ``num_episodes`` is given, only
-    that many of the newest candidates are returned. Always returns newest-first.
+    ``all_episodes`` are audio/mpeg (entry, link) pairs from the feed. Results
+    are newest-first. The new-feed guard (whether a bare run may proceed at all)
+    lives in the caller; this function purely applies the filters.
+
+    Filtering order:
+    1. Incremental anchor: when ``last_downloaded`` is set (feed has dated prior
+       downloads), only episodes published strictly after it are candidates —
+       nothing already owned is re-fetched; dateless entries are kept so catch-up
+       never permanently drops them. When it is None (no dated anchor), the whole
+       history is the base pool.
+    2. ``since`` (datetime): keep episodes published on/after it. Dateless
+       entries are excluded because an explicit window is precise.
+    3. ``num_episodes``: cap to that many newest candidates (>= 1).
     """
     ordered = sorted(all_episodes, key=_episode_sort_key, reverse=True)
 
     if last_downloaded is not None:
-        # Incremental: keep entries published strictly after the cutoff, AND keep
-        # dateless entries — otherwise a feed that mixes dated and dateless items
-        # would silently drop dateless episodes forever once a dated one set the
-        # cutoff. guid dedup downstream prevents re-downloading recorded ones.
-        candidates = [
+        # Incremental: strictly after the cutoff; keep dateless entries too.
+        base = [
             pair
             for pair in ordered
             if (dt := _entry_datetime(pair[0])) is None or dt > last_downloaded
         ]
     else:
-        candidates = ordered
+        base = ordered
+
+    if since is not None:
+        # An explicit date window is exact: a dateless entry can't be proven to
+        # fall on/after `since`, so exclude it. (Dateless entries are only kept
+        # for the incremental anchor above, so catch-up never permanently drops
+        # them — an explicit --since is a deliberate, precise filter.)
+        base = [
+            pair for pair in base if (dt := _entry_datetime(pair[0])) is not None and dt >= since
+        ]
 
     if num_episodes is not None and num_episodes < 1:
         return []
     if num_episodes is not None:
-        return candidates[:num_episodes]
-    return candidates
+        return base[:num_episodes]
+    return base
 
 
 def prune_to_keep_last(conn, feed_id, save_dir):
@@ -549,6 +583,8 @@ def parse_and_download(
     feed_id=None,
     feed=None,
     session=None,
+    since=None,
+    full_history=False,
 ):
     """Parse the RSS feed and download any episodes not already in the database."""
     if not conn or not feed_id or not feed:
@@ -566,8 +602,8 @@ def parse_and_download(
 
     # Decide which episodes to consider this run. Incremental sync: only
     # episodes published strictly after the newest one already downloaded are
-    # candidates (unless the feed has nothing downloaded yet, in which case the
-    # whole history is available). --num-episodes further caps the count.
+    # candidates once a feed has any download. --num-episodes caps the count,
+    # --since sets a lower date window, --all opts into a full archive download.
     if num_episodes is not None and num_episodes < 1:
         logging.error(
             '--num-episodes must be a positive integer (got %s). Nothing to download.',
@@ -582,7 +618,7 @@ def parse_and_download(
             last_downloaded.isoformat(),
         )
     else:
-        logging.info('No prior downloads for this feed; treating full history as new.')
+        logging.info('No prior downloads for this feed.')
 
     if num_episodes is not None:
         logging.info(
@@ -590,8 +626,29 @@ def parse_and_download(
             num_episodes,
             num_episodes,
         )
+    if since is not None:
+        logging.info(
+            '--since set to %s. Only episodes from this date are considered.', since.date()
+        )
 
-    episodes_to_consider = _select_candidates(all_episodes, last_downloaded, num_episodes)
+    # New-feed guard: a feed with NO downloaded rows at all must not be silently
+    # fully downloaded. It needs an explicit control: --num-episodes, --since,
+    # or --all. (An all-dateless feed still counts as established via row count,
+    # so it is not blocked from incremental catch-up.)
+    has_any = _feed_has_episodes(conn, feed_id)
+    if not has_any and not full_history and num_episodes is None and since is None:
+        logging.info(
+            'This feed has no downloads yet. Nothing downloaded: pass --num-episodes N, '
+            '--since YYYY-MM-DD, or --all to seed it (otherwise no episodes are fetched).'
+        )
+        return
+
+    episodes_to_consider = _select_candidates(
+        all_episodes,
+        last_downloaded,
+        num_episodes,
+        since=since,
+    )
 
     # Filter out episodes that have already been downloaded.
     episodes_to_download = []
@@ -695,6 +752,17 @@ def main():
         default=None,
         help='Only download up to N newest episodes published after the last downloaded one',
     )
+    parser.add_argument(
+        '--since',
+        default=None,
+        metavar='YYYY-MM-DD',
+        help='Only download episodes published on or after this date',
+    )
+    parser.add_argument(
+        '--all',
+        action='store_true',
+        help='On a feed with no prior downloads, download the full archive',
+    )
     args = parser.parse_args()
 
     if args.list_feeds:
@@ -702,6 +770,14 @@ def main():
         return
 
     db_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'downloads.db')
+
+    # Parse --since into a naive datetime (midnight local) for comparison.
+    since_date = None
+    if args.since:
+        try:
+            since_date = datetime.strptime(args.since, '%Y-%m-%d')
+        except ValueError:
+            parser.error('--since must be a date in YYYY-MM-DD format')
 
     # When --feed-id is used the URL positional is not needed, so a lone
     # positional argument is interpreted as save_dir rather than rss_url.
@@ -758,6 +834,8 @@ def main():
                 conn=conn,
                 feed_id=feed_id,
                 feed=feed,
+                since=since_date,
+                full_history=args.all,
             )
             if args.keep_last:
                 prune_to_keep_last(conn, feed_id, args.save_dir)

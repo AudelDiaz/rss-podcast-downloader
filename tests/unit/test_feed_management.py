@@ -63,6 +63,82 @@ def test_select_candidates_keeps_dateless_when_incremental(mod):
     assert 'e-2020' in titles
 
 
+def test_select_candidates_since_window_new_feed(mod):
+    """--since keeps only episodes published on/after the date (new feed)."""
+    eps = [_mk_pair('e-2001', 2001), _mk_pair('e-2010', 2010), _mk_pair('e-2020', 2020)]
+    since = mod._parse_date('2010-06-01')
+    sel = mod._select_candidates(eps, None, since=since)
+    # e-2010 publishes 2010-01-01, before the 2010-06-01 cutoff -> excluded.
+    assert [p[0]['title'] for p in sel] == ['e-2020']
+
+
+def test_select_candidates_since_boundary_inclusive(mod):
+    eps = [_mk_pair('e-2020', 2020), _mk_pair('e-2010', 2010)]
+    since = mod._parse_date('2020-01-01')  # equal to e-2020 publish -> inclusive
+    sel = mod._select_candidates(eps, None, since=since)
+    assert [p[0]['title'] for p in sel] == ['e-2020']
+
+
+def test_select_candidates_since_and_num_episodes(mod):
+    eps = [_mk_pair('e-2001', 2001), _mk_pair('e-2010', 2010), _mk_pair('e-2020', 2020)]
+    since = mod._parse_date('2005-01-01')
+    sel = mod._select_candidates(eps, None, num_episodes=1, since=since)
+    assert [p[0]['title'] for p in sel] == ['e-2020']
+
+
+def test_select_candidates_new_feed_no_filter_returns_all(mod):
+    """On a new feed (no anchor) with no window/cap, all episodes are candidates.
+
+    Whether the run is ALLOWED at all is decided by the caller's new-feed guard
+    (integration-tested); the pure selector just returns the full newest-first pool.
+    """
+    eps = [_mk_pair('e-2001', 2001), _mk_pair('e-2020', 2020)]
+    sel = mod._select_candidates(eps, None)
+    assert [p[0]['title'] for p in sel] == ['e-2020', 'e-2001']
+
+
+def test_select_candidates_since_excludes_dateless(mod):
+    """An explicit --since window must not pull in undated episodes."""
+    dateless = ({'title': 'no-date', 'links': []}, None)
+    eps = [dateless, _mk_pair('e-2020', 2020)]
+    since = mod._parse_date('2010-01-01')
+    sel = mod._select_candidates(eps, None, since=since)
+    assert [p[0]['title'] for p in sel] == ['e-2020']
+
+
+def test_select_candidates_established_feed_ignores_since_older_than_owned(mod):
+    """On an established feed, --since earlier than the newest-owned still yields nothing new."""
+    eps = [_mk_pair('e-2010', 2010), _mk_pair('e-2020', 2020)]
+    # feed owns newest at 2020
+    last = mod._parse_date('2020-01-01T12:00:00')
+    since = mod._parse_date('2015-01-01')  # earlier than owned -> no strictly-newer episodes
+    sel = mod._select_candidates(eps, last, since=since)
+    assert sel == []
+
+
+def test_feed_has_episodes_false_when_none(mod, tmp_path):
+    conn = mod.setup_database(str(tmp_path / 't.db'))
+    feed_id = mod.get_or_create_feed(conn, 'http://a.com/feed', 'A')
+    assert mod._feed_has_episodes(conn, feed_id) is False
+    conn.close()
+
+
+def test_feed_has_episodes_true_even_if_all_dateless(mod, tmp_path):
+    """An all-dateless feed still counts as established (has episode rows)."""
+    conn = mod.setup_database(str(tmp_path / 't.db'))
+    feed_id = mod.get_or_create_feed(conn, 'http://a.com/feed', 'A')
+    conn.execute(
+        'INSERT INTO episodes (feed_id, guid, title, published, filepath, downloaded_at) '
+        "VALUES (?, ?, ?, '', ?, ?)",
+        (feed_id, 'g1', 'dateless ep', '/x/dateless.mp3', 'now'),
+    )
+    conn.commit()
+    assert mod._feed_has_episodes(conn, feed_id) is True
+    # And _get_last_downloaded_date returns None for it (no dated anchor).
+    assert mod._get_last_downloaded_date(conn, feed_id) is None
+    conn.close()
+
+
 def test_get_last_downloaded_date_empty(mod, tmp_path):
     conn = mod.setup_database(str(tmp_path / 't.db'))
     feed_id = mod.get_or_create_feed(conn, 'http://a.com/feed', 'A')
