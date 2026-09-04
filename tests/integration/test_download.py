@@ -146,3 +146,60 @@ def test_num_episodes_limits_to_newest(mod, http_server, tmp_path):
     assert sorted(p.name for p in save_dir.iterdir()) == ['2002-10-02_newest_episode.mp3']
 
     conn.close()
+
+
+def _seed_episode(conn, feed_id, guid, title, published, filepath):
+    conn.execute(
+        'INSERT INTO episodes (feed_id, guid, title, published, filepath, downloaded_at) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        (feed_id, guid, title, published, filepath, 'now'),
+    )
+    conn.commit()
+
+
+def test_incremental_sync_downloads_only_newer(mod, http_server, tmp_path):
+    """With no --num-episodes, only episodes newer than the newest downloaded go."""
+    save_dir = tmp_path / 'podcasts'
+    save_dir.mkdir()
+    db_path = tmp_path / 'test.db'
+
+    feed = _feed(mod, http_server)
+    conn = mod.setup_database(str(db_path))
+    feed_id = mod.get_or_create_feed(conn, f'{http_server}/feed.xml', feed.feed.get('title', 'N/A'))
+
+    # Simulate that the OLDER episode was already downloaded (2002-10-01).
+    _seed_episode(conn, feed_id, 'older-1', 'Older Episode', '2002-10-01T13:00:00', '/x/older.mp3')
+
+    mod.parse_and_download(str(save_dir), False, None, conn=conn, feed_id=feed_id, feed=feed)
+
+    # Only the newer episode (published 2002-10-02) should be fetched.
+    assert _FeedHandler.download_count == {'ep-newest.mp3': 1, 'ep-older.mp3': 0}
+    assert sorted(p.name for p in save_dir.iterdir()) == ['2002-10-02_newest_episode.mp3']
+    conn.close()
+
+
+def test_incremental_sync_fully_caught_up_downloads_nothing(mod, http_server, tmp_path):
+    """When the newest episode is already downloaded, no new downloads happen."""
+    save_dir = tmp_path / 'podcasts'
+    save_dir.mkdir()
+    db_path = tmp_path / 'test.db'
+
+    feed = _feed(mod, http_server)
+    conn = mod.setup_database(str(db_path))
+    feed_id = mod.get_or_create_feed(conn, f'{http_server}/feed.xml', feed.feed.get('title', 'N/A'))
+
+    # Newest episode (2002-10-02) already present -> fully caught up.
+    _seed_episode(
+        conn,
+        feed_id,
+        'newest-1',
+        'Newest Episode',
+        '2002-10-02T13:00:00',
+        '/x/newest.mp3',
+    )
+
+    mod.parse_and_download(str(save_dir), False, None, conn=conn, feed_id=feed_id, feed=feed)
+
+    assert _FeedHandler.download_count == {'ep-newest.mp3': 0, 'ep-older.mp3': 0}
+    assert sorted(p.name for p in save_dir.iterdir()) == []
+    conn.close()

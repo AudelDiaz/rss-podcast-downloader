@@ -10,9 +10,13 @@ skip already-fetched episodes and multiple feeds can be managed independently.
 
 Usage:
     python rss-podcast-downloader.py <RSS_FEED_URL> <SAVE_DIRECTORY> [--save_text]
+    python rss-podcast-downloader.py --feed-id N [SAVE_DIRECTORY] [--save_text]
 
 Options:
-    --num-episodes N   Only consider the N most recently published episodes.
+    --feed-id N        Pull a feed already stored in the database by its id.
+    --list-feeds       List all feeds in the database (with their save dirs) and exit.
+    --keep-last        Keep only the newest episode per feed after downloading.
+    --num-episodes N   Only consider N episodes published after the last download.
     --save_text        Also save a .txt sidecar with episode details.
 
 Example:
@@ -260,7 +264,8 @@ def setup_database(db_path=None):
         CREATE TABLE IF NOT EXISTS feeds (
             feed_id INTEGER PRIMARY KEY AUTOINCREMENT,
             feed_url TEXT UNIQUE NOT NULL,
-            feed_title TEXT
+            feed_title TEXT,
+            save_dir TEXT
         )
         """
     )
@@ -279,22 +284,197 @@ def setup_database(db_path=None):
         )
         """
     )
+
+    # Add the save_dir column to existing databases that predate it.
+    feeds_columns = [row[1] for row in cursor.execute('PRAGMA table_info(feeds)')]
+    if 'save_dir' not in feeds_columns:
+        logging.warning('Adding "save_dir" column to existing feeds table.')
+        cursor.execute('ALTER TABLE feeds ADD COLUMN save_dir TEXT')
+
+    _backfill_feeds_save_dir(cursor)
     conn.commit()
     logging.info('Database setup complete at %s', db_path)
     return conn
 
 
-def get_or_create_feed(conn, feed_url, feed_title):
+def _backfill_feeds_save_dir(cursor):
+    """For feeds with episodes but no save_dir, recover it from the newest filepath.
+
+    The destination folder is the directory of the most recently downloaded
+    episode (highest episode_id) for that feed.
+    """
+    rows = cursor.execute(
+        """
+        SELECT e.feed_id, e.filepath
+        FROM episodes e
+        JOIN feeds f ON f.feed_id = e.feed_id
+        WHERE (f.save_dir IS NULL OR f.save_dir = '')
+          AND e.filepath IS NOT NULL AND e.filepath != ''
+          AND e.episode_id = (
+              SELECT MAX(e2.episode_id) FROM episodes e2 WHERE e2.feed_id = e.feed_id
+          )
+        """
+    ).fetchall()
+    for feed_id, filepath in rows:
+        save_dir = os.path.dirname(os.path.abspath(filepath))
+        if save_dir:
+            cursor.execute('UPDATE feeds SET save_dir = ? WHERE feed_id = ?', (save_dir, feed_id))
+            logging.info('Back-filled save_dir for feed %s: %s', feed_id, save_dir)
+
+
+def get_or_create_feed(conn, feed_url, feed_title, save_dir=None):
     """Get the ``feed_id`` for a ``feed_url``, creating the feed if it doesn't exist."""
     cursor = conn.cursor()
     cursor.execute('SELECT feed_id FROM feeds WHERE feed_url = ?', (feed_url,))
     result = cursor.fetchone()
+    # Normalize once so the INSERT and the UPDATE paths persist the same value.
+    save_dir = os.path.abspath(save_dir) if save_dir else None
     if result:
-        return result[0]
-    cursor.execute('INSERT INTO feeds (feed_url, feed_title) VALUES (?, ?)', (feed_url, feed_title))
+        feed_id = result[0]
+        if save_dir is not None:
+            set_feed_save_dir(conn, feed_id, save_dir)
+        return feed_id
+    cursor.execute(
+        'INSERT INTO feeds (feed_url, feed_title, save_dir) VALUES (?, ?, ?)',
+        (feed_url, feed_title, save_dir),
+    )
     conn.commit()
     logging.info('Added new feed to database: %s', feed_title)
     return cursor.lastrowid
+
+
+def get_feed_save_dir(conn, feed_id):
+    """Return the stored ``save_dir`` for ``feed_id``, or None if not set."""
+    cursor = conn.cursor()
+    cursor.execute('SELECT save_dir FROM feeds WHERE feed_id = ?', (feed_id,))
+    result = cursor.fetchone()
+    value = result[0] if result else None
+    return value or None
+
+
+def set_feed_save_dir(conn, feed_id, save_dir):
+    """Persist the (normalized, absolute) save directory for a feed."""
+    if not save_dir:
+        return
+    abs_dir = os.path.abspath(save_dir)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE feeds SET save_dir = ? WHERE feed_id = ?', (abs_dir, feed_id))
+    conn.commit()
+
+
+def list_feeds(db_path=None):
+    """Print every feed stored in the database, one per line.
+
+    Uses ``downloads.db`` next to the script unless ``db_path`` is provided.
+    Runs schema setup so pre-existing databases are migrated first.
+    """
+    conn = setup_database(db_path)
+    try:
+        rows = conn.execute('SELECT feed_id, feed_url, feed_title, save_dir FROM feeds').fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        print('No feeds found in database.')
+        return
+    for feed_id, feed_url, feed_title, save_dir in rows:
+        print(f'{feed_id} | {feed_url} | {feed_title} | {save_dir or ""}')
+
+
+def get_feed_url_by_id(conn, feed_id):
+    """Return the stored ``feed_url`` for ``feed_id``, or None if not found."""
+    cursor = conn.cursor()
+    cursor.execute('SELECT feed_url FROM feeds WHERE feed_id = ?', (feed_id,))
+    result = cursor.fetchone()
+    return result[0] if result else None
+
+
+def _get_last_downloaded_date(conn, feed_id):
+    """Return the newest ``published`` datetime already downloaded for a feed.
+
+    Returns None when no episodes have been downloaded for the feed yet.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT MAX(published) FROM episodes WHERE feed_id = ? AND published != ''",
+        (feed_id,),
+    )
+    value = cursor.fetchone()[0]
+    if not value:
+        return None
+    # published is stored as 'YYYY-MM-DDTHH:MM:SS' by the downloader.
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _select_candidates(all_episodes, last_downloaded, num_episodes=None):
+    """Pick the (entry, link) pairs this run should consider downloading.
+
+    ``all_episodes`` are audio/mpeg (entry, link) pairs from the feed. When
+    ``last_downloaded`` is not None, only episodes published strictly after it
+    are candidates (incremental catch-up). When ``num_episodes`` is given, only
+    that many of the newest candidates are returned. Always returns newest-first.
+    """
+    ordered = sorted(all_episodes, key=_episode_sort_key, reverse=True)
+
+    if last_downloaded is not None:
+        # Incremental: keep entries published strictly after the cutoff, AND keep
+        # dateless entries — otherwise a feed that mixes dated and dateless items
+        # would silently drop dateless episodes forever once a dated one set the
+        # cutoff. guid dedup downstream prevents re-downloading recorded ones.
+        candidates = [
+            pair
+            for pair in ordered
+            if (dt := _entry_datetime(pair[0])) is None or dt > last_downloaded
+        ]
+    else:
+        candidates = ordered
+
+    if num_episodes is not None and num_episodes < 1:
+        return []
+    if num_episodes is not None:
+        return candidates[:num_episodes]
+    return candidates
+
+
+def prune_to_keep_last(conn, feed_id, save_dir):
+    """Keep only the newest downloaded episode row (and file) for a feed.
+
+    Deletes older episode rows for ``feed_id`` and removes their on-disk files
+    when they live under ``save_dir``. The newest row is kept as a sync reference.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT episode_id, filepath FROM episodes WHERE feed_id = ? '
+        'ORDER BY published DESC, episode_id DESC',
+        (feed_id,),
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        return
+    # Rows to keep (the newest). Only delete a file if no KEPT row references it,
+    # so a shared filepath (e.g. re-posted episodes) is not removed out from under
+    # the surviving row.
+    kept_paths = {os.path.abspath(filepath) for _, filepath in rows[:1] if filepath}
+    removed = 0
+    for episode_id, filepath in rows[1:]:
+        cursor.execute('DELETE FROM episodes WHERE episode_id = ?', (episode_id,))
+        removed += 1
+        if filepath and os.path.abspath(filepath) not in kept_paths:
+            try:
+                if os.path.commonpath([os.path.abspath(save_dir), os.path.abspath(filepath)]) == (
+                    os.path.abspath(save_dir)
+                ) and os.path.exists(filepath):
+                    os.remove(filepath)
+                    logging.info('Removed kept-last pruned file: %s', filepath)
+            except (OSError, ValueError):
+                # File already gone or outside save_dir; not fatal.
+                pass
+    conn.commit()
+    if removed:
+        logging.info('--keep-last: pruned %s old episode(s); keeping newest.', removed)
 
 
 def save_text_file(entry, filename):
@@ -384,22 +564,34 @@ def parse_and_download(
         if link.type == 'audio/mpeg'
     ]
 
-    # Consider only the N most recently published episodes.
-    episodes_to_consider = all_episodes
-    if num_episodes is not None:
-        if num_episodes < 1:
-            logging.error(
-                '--num-episodes must be a positive integer (got %s). Nothing to download.',
-                num_episodes,
-            )
-            return
+    # Decide which episodes to consider this run. Incremental sync: only
+    # episodes published strictly after the newest one already downloaded are
+    # candidates (unless the feed has nothing downloaded yet, in which case the
+    # whole history is available). --num-episodes further caps the count.
+    if num_episodes is not None and num_episodes < 1:
+        logging.error(
+            '--num-episodes must be a positive integer (got %s). Nothing to download.',
+            num_episodes,
+        )
+        return
+
+    last_downloaded = _get_last_downloaded_date(conn, feed_id)
+    if last_downloaded is not None:
         logging.info(
-            '--num-episodes set to %s. Considering only the %s most recent episodes.',
+            'Newest already-downloaded episode for this feed: %s',
+            last_downloaded.isoformat(),
+        )
+    else:
+        logging.info('No prior downloads for this feed; treating full history as new.')
+
+    if num_episodes is not None:
+        logging.info(
+            '--num-episodes set to %s. Considering up to %s newest unseen episodes.',
             num_episodes,
             num_episodes,
         )
-        ordered = sorted(all_episodes, key=_episode_sort_key, reverse=True)
-        episodes_to_consider = ordered[:num_episodes]
+
+    episodes_to_consider = _select_candidates(all_episodes, last_downloaded, num_episodes)
 
     # Filter out episodes that have already been downloaded.
     episodes_to_download = []
@@ -478,8 +670,22 @@ def parse_and_download(
 
 def main():
     parser = argparse.ArgumentParser(description='RSS Podcast Downloader')
-    parser.add_argument('rss_url', help='RSS feed URL (include authentication token if applicable)')
-    parser.add_argument('save_dir', help='Directory to save downloaded files')
+    parser.add_argument('rss_url', nargs='?', help='RSS feed URL (omit if using --feed-id)')
+    parser.add_argument('save_dir', nargs='?', help='Directory to save downloaded files')
+    parser.add_argument(
+        '--feed-id',
+        type=int,
+        default=None,
+        help='Pull a feed already stored in the database by its id (overrides rss_url)',
+    )
+    parser.add_argument(
+        '--list-feeds', action='store_true', help='List all feeds in the database and exit'
+    )
+    parser.add_argument(
+        '--keep-last',
+        action='store_true',
+        help='After downloading, keep only the newest episode per feed as a sync reference',
+    )
     parser.add_argument(
         '--save_text', action='store_true', help='Save .txt files with extra episode data'
     )
@@ -487,9 +693,52 @@ def main():
         '--num-episodes',
         type=int,
         default=None,
-        help='Only download from the N most recently published episodes',
+        help='Only download up to N newest episodes published after the last downloaded one',
     )
     args = parser.parse_args()
+
+    if args.list_feeds:
+        list_feeds()
+        return
+
+    db_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'downloads.db')
+
+    # When --feed-id is used the URL positional is not needed, so a lone
+    # positional argument is interpreted as save_dir rather than rss_url.
+    if args.feed_id is not None and args.save_dir is None and args.rss_url is not None:
+        args.save_dir = args.rss_url
+        args.rss_url = None
+
+    # Resolve the feed URL: --feed-id (from DB) wins over the positional rss_url.
+    if args.feed_id is not None:
+        # setup_database() ensures the schema (incl. save_dir) exists first.
+        lookup = setup_database(db_path)
+        try:
+            stored_url = get_feed_url_by_id(lookup, args.feed_id)
+            stored_dir = get_feed_save_dir(lookup, args.feed_id)
+        finally:
+            lookup.close()
+        if not stored_url:
+            parser.error(f'No feed found with --feed-id {args.feed_id} in the database.')
+        args.rss_url = stored_url
+        # If the user gave no folder, fall back to the feed's stored one.
+        if args.save_dir is None:
+            if stored_dir:
+                args.save_dir = stored_dir
+                logging.info(
+                    'Using stored save directory for feed %s: %s', args.feed_id, stored_dir
+                )
+            else:
+                parser.error(
+                    f'No save directory given and feed {args.feed_id} has none stored. '
+                    'Provide a save_dir or run once with one to persist it.'
+                )
+
+    if not args.rss_url:
+        parser.error('rss_url is required unless --feed-id is used')
+
+    if not args.save_dir:
+        parser.error('save_dir is required on the first download for a feed')
 
     conn = None
     try:
@@ -499,7 +748,9 @@ def main():
         if content:
             feed = feedparser.parse(content)
             conn = setup_database()
-            feed_id = get_or_create_feed(conn, args.rss_url, feed.feed.get('title', 'N/A'))
+            feed_id = get_or_create_feed(
+                conn, args.rss_url, feed.feed.get('title', 'N/A'), save_dir=args.save_dir
+            )
             parse_and_download(
                 args.save_dir,
                 args.save_text,
@@ -508,6 +759,8 @@ def main():
                 feed_id=feed_id,
                 feed=feed,
             )
+            if args.keep_last:
+                prune_to_keep_last(conn, feed_id, args.save_dir)
     except Exception as e:
         logging.error('An unexpected error occurred: %s', e, exc_info=True)
     finally:
