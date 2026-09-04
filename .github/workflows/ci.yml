@@ -3,7 +3,9 @@ name: CI
 on:
   push:
     branches: ['**']
+    paths-ignore: ['**.md', 'docs/**', 'config.example.toml']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'config.example.toml']
 
 jobs:
   lint-and-unit:

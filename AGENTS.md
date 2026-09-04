@@ -36,6 +36,7 @@ Classify each task FIRST, then run only the phases its size requires.
 
 - **S (small)** — single file, no logic change (typo, comment, config value,
   one string). Implement only. No spec/review/tests unless the diff changes logic.
+- **S-docs (docs-only)** — only `*.md`, `docs/**`, `config.example.toml`, `CHANGELOG.md`, `README.md`. No spec, no tests, no adversarial review — only `ruff format --check` if needed. If diff touches `*.py`, `pyproject.toml`, `requirements.txt`, or `.github/**`, re-classify as M/L. Detection: `git diff --stat --name-only` all paths match `^(README|CHANGELOG|config\.example\.toml|docs/|.*\.md$)`.
 - **M (medium)** — multiple files OR new logic / branching / thresholds.
   Phases: understand → implement → test → adversarial review. Write a spec
   (`sdd`, save to `docs/specs/`); dispatch an adversarial review on the diff.
