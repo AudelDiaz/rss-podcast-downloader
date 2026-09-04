@@ -327,6 +327,8 @@ def get_or_create_feed(conn, feed_url, feed_title, save_dir=None):
     cursor = conn.cursor()
     cursor.execute('SELECT feed_id FROM feeds WHERE feed_url = ?', (feed_url,))
     result = cursor.fetchone()
+    # Normalize once so the INSERT and the UPDATE paths persist the same value.
+    save_dir = os.path.abspath(save_dir) if save_dir else None
     if result:
         feed_id = result[0]
         if save_dir is not None:
@@ -418,10 +420,14 @@ def _select_candidates(all_episodes, last_downloaded, num_episodes=None):
     ordered = sorted(all_episodes, key=_episode_sort_key, reverse=True)
 
     if last_downloaded is not None:
+        # Incremental: keep entries published strictly after the cutoff, AND keep
+        # dateless entries — otherwise a feed that mixes dated and dateless items
+        # would silently drop dateless episodes forever once a dated one set the
+        # cutoff. guid dedup downstream prevents re-downloading recorded ones.
         candidates = [
             pair
             for pair in ordered
-            if (dt := _entry_datetime(pair[0])) is not None and dt > last_downloaded
+            if (dt := _entry_datetime(pair[0])) is None or dt > last_downloaded
         ]
     else:
         candidates = ordered
@@ -448,12 +454,15 @@ def prune_to_keep_last(conn, feed_id, save_dir):
     rows = cursor.fetchall()
     if not rows:
         return
-    newest_id, _newest_path = rows[0]
+    # Rows to keep (the newest). Only delete a file if no KEPT row references it,
+    # so a shared filepath (e.g. re-posted episodes) is not removed out from under
+    # the surviving row.
+    kept_paths = {os.path.abspath(filepath) for _, filepath in rows[:1] if filepath}
     removed = 0
     for episode_id, filepath in rows[1:]:
         cursor.execute('DELETE FROM episodes WHERE episode_id = ?', (episode_id,))
         removed += 1
-        if filepath:
+        if filepath and os.path.abspath(filepath) not in kept_paths:
             try:
                 if os.path.commonpath([os.path.abspath(save_dir), os.path.abspath(filepath)]) == (
                     os.path.abspath(save_dir)
@@ -710,8 +719,7 @@ def main():
         finally:
             lookup.close()
         if not stored_url:
-            logging.error('No feed found with --feed-id %s in the database.', args.feed_id)
-            return
+            parser.error(f'No feed found with --feed-id {args.feed_id} in the database.')
         args.rss_url = stored_url
         # If the user gave no folder, fall back to the feed's stored one.
         if args.save_dir is None:

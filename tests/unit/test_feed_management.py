@@ -49,6 +49,20 @@ def test_select_candidates_rejects_nonpositive_num(mod):
     assert mod._select_candidates(eps, None, -1) == []
 
 
+def test_select_candidates_keeps_dateless_when_incremental(mod):
+    """A dateless episode must not be silently dropped once a dated one sets the cutoff."""
+    dateless = ({'title': 'no-date', 'links': []}, None)
+    dated_old = _mk_pair('dated-old', 2001)
+    eps = [dateless, dated_old, _mk_pair('e-2020', 2020)]
+    last = mod._parse_date('2005-01-01')
+    sel = mod._select_candidates(eps, last, None)
+    titles = [p[0]['title'] for p in sel]
+    # dated-old (2001) is excluded; the dateless entry and 2020 remain.
+    assert 'dated-old' not in titles
+    assert 'no-date' in titles
+    assert 'e-2020' in titles
+
+
 def test_get_last_downloaded_date_empty(mod, tmp_path):
     conn = mod.setup_database(str(tmp_path / 't.db'))
     feed_id = mod.get_or_create_feed(conn, 'http://a.com/feed', 'A')

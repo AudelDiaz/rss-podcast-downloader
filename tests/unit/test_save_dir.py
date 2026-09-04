@@ -90,3 +90,49 @@ def test_list_feeds_includes_save_dir(capsys, mod, tmp_path):
     mod.list_feeds(str(tmp_path / 't.db'))
     out = capsys.readouterr().out
     assert 'http://a/f | A | /d' in out
+
+
+def test_get_or_create_feed_normalizes_save_dir_on_insert(mod, tmp_path):
+    """Fresh-feed INSERT must persist the absolute path, matching the update path."""
+    conn = mod.setup_database(str(tmp_path / 't.db'))
+    feed_id = mod.get_or_create_feed(conn, 'http://a.com/f', 'A', save_dir='rel/foo')
+    saved = mod.get_feed_save_dir(conn, feed_id)
+    assert saved == os.path.abspath('rel/foo')
+    assert not saved.startswith('rel/')
+    conn.close()
+
+
+def test_prune_to_keep_last_preserves_shared_file(mod, tmp_path):
+    """If an older row shares a filepath with the kept newest row, its file survives."""
+    conn = mod.setup_database(str(tmp_path / 't.db'))
+    save_dir = tmp_path / 'save'
+    save_dir.mkdir()
+    feed_id = mod.get_or_create_feed(conn, 'http://a.com/f', 'A')
+
+    shared = save_dir / 'same.mp3'
+    shared.write_bytes(b'x')
+    rows = [
+        # newest (published 2025) and an older row share the same file path.
+        (feed_id, 'g-new', 'New', '2025-06-15T00:00:00', str(shared), 'now'),
+        (feed_id, 'g-old', 'Old', '2020-01-01T00:00:00', str(shared), 'now'),
+        (feed_id, 'g-mid', 'Mid', '2023-01-01T00:00:00', str(save_dir / 'mid.mp3'), 'now'),
+    ]
+    (save_dir / 'mid.mp3').write_bytes(b'x')
+    conn.executemany(
+        'INSERT INTO episodes (feed_id, guid, title, published, filepath, downloaded_at) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        rows,
+    )
+    conn.commit()
+
+    mod.prune_to_keep_last(conn, feed_id, str(save_dir))
+
+    remaining = [
+        r[0] for r in conn.execute('SELECT title FROM episodes WHERE feed_id = ?', (feed_id,))
+    ]
+    assert remaining == ['New']  # newest survives
+    # Shared file (referenced by kept row) must still exist.
+    assert shared.exists()
+    # The uniquely-owned older file (mid.mp3) is removed.
+    assert not (save_dir / 'mid.mp3').exists()
+    conn.close()
