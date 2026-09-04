@@ -397,7 +397,9 @@ def get_feed_url_by_id(conn, feed_id):
 def _get_last_downloaded_date(conn, feed_id):
     """Return the newest ``published`` datetime already downloaded for a feed.
 
-    Returns None when no episodes have been downloaded for the feed yet.
+    Returns None when no dated episodes have been downloaded for the feed yet.
+    (An all-dateless feed has no dated anchor; use :func:`_feed_has_episodes`
+    to distinguish that from a truly brand-new feed.)
     """
     cursor = conn.cursor()
     cursor.execute(
@@ -414,26 +416,33 @@ def _get_last_downloaded_date(conn, feed_id):
         return None
 
 
+def _feed_has_episodes(conn, feed_id):
+    """Return True if the feed has ANY downloaded episode rows (dated or not)."""
+    cursor = conn.cursor()
+    cursor.execute('SELECT 1 FROM episodes WHERE feed_id = ? LIMIT 1', (feed_id,))
+    return cursor.fetchone() is not None
+
+
 def _select_candidates(
     all_episodes,
     last_downloaded=None,
     num_episodes=None,
     since=None,
-    full_history=False,
 ):
     """Pick the (entry, link) pairs this run should consider downloading.
 
     ``all_episodes`` are audio/mpeg (entry, link) pairs from the feed. Results
-    are newest-first.
+    are newest-first. The new-feed guard (whether a bare run may proceed at all)
+    lives in the caller; this function purely applies the filters.
 
     Filtering order:
-    1. Incremental anchor: when ``last_downloaded`` is set (feed has prior
+    1. Incremental anchor: when ``last_downloaded`` is set (feed has dated prior
        downloads), only episodes published strictly after it are candidates —
-       nothing already owned is re-fetched. When it is None (new feed) the whole
-       history is the base pool unless ``full_history`` is False and no other
-       control is provided (see the caller's new-feed guard).
+       nothing already owned is re-fetched; dateless entries are kept so catch-up
+       never permanently drops them. When it is None (no dated anchor), the whole
+       history is the base pool.
     2. ``since`` (datetime): keep episodes published on/after it. Dateless
-       entries are always kept so they are never permanently dropped.
+       entries are excluded because an explicit window is precise.
     3. ``num_episodes``: cap to that many newest candidates (>= 1).
     """
     ordered = sorted(all_episodes, key=_episode_sort_key, reverse=True)
@@ -449,7 +458,13 @@ def _select_candidates(
         base = ordered
 
     if since is not None:
-        base = [pair for pair in base if (dt := _entry_datetime(pair[0])) is None or dt >= since]
+        # An explicit date window is exact: a dateless entry can't be proven to
+        # fall on/after `since`, so exclude it. (Dateless entries are only kept
+        # for the incremental anchor above, so catch-up never permanently drops
+        # them — an explicit --since is a deliberate, precise filter.)
+        base = [
+            pair for pair in base if (dt := _entry_datetime(pair[0])) is not None and dt >= since
+        ]
 
     if num_episodes is not None and num_episodes < 1:
         return []
@@ -616,10 +631,12 @@ def parse_and_download(
             '--since set to %s. Only episodes from this date are considered.', since.date()
         )
 
-    # New-feed guard: a feed with no prior downloads must NOT be silently fully
-    # downloaded. It needs an explicit control: --num-episodes, --since, or --all.
-    is_new_feed = last_downloaded is None
-    if is_new_feed and not full_history and num_episodes is None and since is None:
+    # New-feed guard: a feed with NO downloaded rows at all must not be silently
+    # fully downloaded. It needs an explicit control: --num-episodes, --since,
+    # or --all. (An all-dateless feed still counts as established via row count,
+    # so it is not blocked from incremental catch-up.)
+    has_any = _feed_has_episodes(conn, feed_id)
+    if not has_any and not full_history and num_episodes is None and since is None:
         logging.info(
             'This feed has no downloads yet. Nothing downloaded: pass --num-episodes N, '
             '--since YYYY-MM-DD, or --all to seed it (otherwise no episodes are fetched).'
@@ -631,7 +648,6 @@ def parse_and_download(
         last_downloaded,
         num_episodes,
         since=since,
-        full_history=full_history,
     )
 
     # Filter out episodes that have already been downloaded.
