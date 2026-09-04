@@ -16,7 +16,7 @@ jobs:
         run: |
           uv venv .venv
           uv pip install --python .venv/bin/python -r requirements.txt
-          uv pip install --python .venv/bin/python pytest ruff
+          uv pip install --python .venv/bin/python pytest==9.1.1 ruff==0.16.6
       - name: Lint
         run: .venv/bin/python -m ruff check . && .venv/bin/python -m ruff format --check .
       - name: Unit tests
@@ -33,6 +33,6 @@ jobs:
         run: |
           uv venv .venv
           uv pip install --python .venv/bin/python -r requirements.txt
-          uv pip install --python .venv/bin/python pytest ruff
+          uv pip install --python .venv/bin/python pytest==9.1.1 ruff==0.16.6
       - name: Integration tests
         run: .venv/bin/python -m pytest tests/integration -v

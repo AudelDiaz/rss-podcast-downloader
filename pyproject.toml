@@ -1,3 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rss-podcast-downloader"
+version = "1.1.0"
+description = "Robust CLI to download, manage and archive podcast episodes from RSS feeds"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "certifi==2024.6.2",
+    "charset-normalizer==3.3.2",
+    "feedparser==6.0.11",
+    "idna==3.7",
+    "requests==2.32.0",
+    "sgmllib3k==1.0.0",
+    "urllib3==2.2.1",
+    "mutagen==1.48.1",
+]
+
+[project.scripts]
+rss-podcast-downloader = "rss_podcast_downloader:main"
+
+[project.urls]
+Homepage = "https://github.com/johnsosoka/rss-podcast-downloader"
+
+[tool.hatch.build.targets.wheel.force-include]
+"rss_podcast_downloader.py" = "rss_podcast_downloader.py"
+"rss-podcast-downloader.py" = "rss-podcast-downloader.py"
+
 [tool.pytest.ini_options]
 testpaths = ["tests/unit", "tests/integration"]
 python_files = ["test_*.py"]
@@ -5,7 +37,7 @@ addopts = "-v --tb=short -p no:cacheprovider"
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RET"]
